@@ -442,6 +442,14 @@ async def process_link(msg: Message):
     url = match.group(0)
     platform = detect_platform(url)
 
+    if platform.get("name") != "Facebook":
+        await msg.reply(
+            "ℹ️ **Dedicated Facebook Auto-Tracker Bot**\n\n"
+            "This bot (@fbdownloaderpagesvidsbot) is dedicated exclusively to auto-tracking Facebook pages.\n\n"
+            "💡 For on-demand downloads from **TikTok, Instagram, Pinterest, YouTube, X, Reddit**, please use your main downloader bot: **@vidsmkdownloaderbot**!"
+        )
+        return
+
     status_msg = await msg.reply(
         f"🔎 **Platform Detected:** {platform['emoji']} *{platform['desc']}*\n"
         f"⏳ Analyzing media stream..."
