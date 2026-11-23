@@ -16,12 +16,13 @@ import yt_dlp
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import FSInputFile, Message
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from dotenv import load_dotenv
 
 # Load local environment
 load_dotenv()
 
-from fb_monitor import FacebookMonitor, DEFAULT_PAGES
+from fb_monitor import FacebookMonitor, DEFAULT_PAGES, resolve_facebook_page
 
 # -------------------------------------------------------------------
 # LOGGING SETUP
@@ -97,7 +98,7 @@ def detect_platform(url: str) -> dict:
 
 
 # -------------------------------------------------------------------
-# KEEP-ALIVE HTTP SERVER (PREVENTS SLEEP ON RENDER / CLOUD HOSTS)
+# KEEP-ALIVE & WEBHOOK HTTP SERVER (RUNS ON RENDER 2)
 # -------------------------------------------------------------------
 async def ping_handler(request: web.Request) -> web.Response:
     return web.json_response({
@@ -106,6 +107,7 @@ async def ping_handler(request: web.Request) -> web.Response:
         "monitored_pages": len(fb_monitor.pages),
         "subscribers": len(fb_monitor.subscribers),
         "seen_posts_count": len(fb_monitor.seen_posts),
+        "initialized_pages": len(fb_monitor.initialized_pages),
     })
 
 async def health_handler(request: web.Request) -> web.Response:
@@ -120,7 +122,7 @@ async def root_handler(request: web.Request) -> web.Response:
     return web.json_response({
         "status": "alive",
         "service": "Facebook Auto-Checker & Media Downloader Bot",
-        "endpoints": {"ping": "/ping", "health": "/health"}
+        "endpoints": {"ping": "/ping", "health": "/health", "webhook": "/api/webhook"}
     })
 
 def create_web_app() -> web.Application:
@@ -128,6 +130,15 @@ def create_web_app() -> web.Application:
     app.router.add_get("/", root_handler)
     app.router.add_get("/ping", ping_handler)
     app.router.add_get("/health", health_handler)
+
+    # Register Telegram webhook handler directly in aiohttp
+    webhook_handler = SimpleRequestHandler(
+        dispatcher=dp,
+        bot=bot,
+    )
+    webhook_handler.register(app, path="/api/webhook")
+    setup_application(app, dp, bot=bot)
+
     return app
 
 async def start_web_server() -> web.AppRunner:
@@ -136,7 +147,7 @@ async def start_web_server() -> web.AppRunner:
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    logger.info(f"Keep-alive HTTP server listening on http://0.0.0.0:{PORT}")
+    logger.info(f"Keep-alive & Webhook HTTP server listening on http://0.0.0.0:{PORT}")
     return runner
 
 async def self_ping_worker():
@@ -158,6 +169,28 @@ async def self_ping_worker():
             except Exception as e:
                 logger.warning(f"Self-ping failed (non-critical): {e}")
             await asyncio.sleep(10 * 60)
+
+
+# -------------------------------------------------------------------
+# BASELINE SEEDING HELPER
+# -------------------------------------------------------------------
+async def seed_page_baseline(page_url: str):
+    """Fetches existing posts for a newly added page and seeds them so only new uploads trigger notifications."""
+    try:
+        html, final_url = await asyncio.to_thread(fb_monitor._fetch_page_html, page_url)
+        if html:
+            posts = fb_monitor._extract_posts_from_html(html, page_url)
+            for post in posts:
+                fb_monitor.mark_seen(post["id"], post)
+                fb_monitor.mark_seen(post["clean_url"], post)
+            logger.info(f"Baseline seeded for {page_url}: recorded {len(posts)} existing posts.")
+        p_key = page_url.strip().lower()
+        fb_monitor.initialized_pages.add(p_key)
+        if final_url:
+            fb_monitor.initialized_pages.add(final_url.strip().lower())
+        fb_monitor._save_json(fb_monitor.initialized_pages_file, list(fb_monitor.initialized_pages))
+    except Exception as e:
+        logger.warning(f"Error seeding baseline for {page_url}: {e}")
 
 
 # -------------------------------------------------------------------
@@ -302,8 +335,8 @@ async def cmd_start(msg: Message):
         "• `/status` - Check monitor status & seen post count\n"
         "• `/checknow` - Run an immediate check of all pages\n"
         "• `/pages` - List all monitored pages\n"
-        "• `/addpage <url>` - Add a Facebook page to monitor\n"
-        "• `/delpage <url>` - Remove a page from monitor\n\n"
+        "• `/add` or `/addpage <url>` - Add a Facebook page to monitor\n"
+        "• `/del` or `/delpage <url>` - Remove a page from monitor\n\n"
         "💡 *You can also paste any video link from Instagram, TikTok, YouTube, Reddit, Facebook, Pinterest to download it on demand!*"
     )
 
@@ -320,6 +353,7 @@ async def cmd_status(msg: Message):
         "📊 **Bot & Monitor Status**\n\n"
         f"• **Status:** {'🔄 Checking now...' if fb_monitor.is_checking else '🟢 Idle / Monitoring'}\n"
         f"• **Monitored Pages:** {len(fb_monitor.pages)}\n"
+        f"• **Initialized Pages:** {len(fb_monitor.initialized_pages)}\n"
         f"• **Total Posts Seen in DB:** {len(fb_monitor.seen_posts)}\n"
         f"• **Subscribed Chats:** {len(fb_monitor.subscribers)}\n"
         f"• **Last Check Pass:** {last_check_str}\n"
@@ -364,7 +398,6 @@ async def cmd_cancel(msg: Message):
 
 @dp.message(Command("add", "addpage"))
 async def cmd_addpage(msg: Message):
-    from api.index import resolve_facebook_page
     parts = msg.text.split(maxsplit=1)
     if len(parts) > 1:
         raw_input = parts[1].strip()
@@ -372,12 +405,13 @@ async def cmd_addpage(msg: Message):
         p_url, p_name, err = await asyncio.to_thread(resolve_facebook_page, raw_input)
         if p_url:
             fb_monitor.add_page(p_url)
+            asyncio.create_task(seed_page_baseline(p_url))
             pages_list = "\n".join([f"{idx+1}. `{p}`" for idx, p in enumerate(fb_monitor.pages)])
             await status_msg.edit_text(
                 f"✅ **Successfully Added to Auto-Grab Monitor!**\n\n"
                 f"📘 **Page Name:** *{p_name}*\n"
                 f"🔗 **Page URL:** `{p_url}`\n\n"
-                f"Whenever a new video or reel is uploaded, it will be automatically delivered here in HD!\n\n"
+                f"Whenever a new video, reel, or photo is uploaded, it will be automatically delivered here in HD!\n\n"
                 f"📋 **Monitored Pages ({len(fb_monitor.pages)}):**\n{pages_list}"
             )
         else:
@@ -418,17 +452,17 @@ async def cmd_delpage(msg: Message):
 async def process_link(msg: Message):
     if LOCAL_USER_STATES.get(msg.chat.id) == "awaiting_add_page":
         LOCAL_USER_STATES.pop(msg.chat.id, None)
-        from api.index import resolve_facebook_page
         status_msg = await msg.reply("🔍 **Detecting Facebook page credentials from your input...**")
         p_url, p_name, err = await asyncio.to_thread(resolve_facebook_page, msg.text)
         if p_url:
             fb_monitor.add_page(p_url)
+            asyncio.create_task(seed_page_baseline(p_url))
             pages_list = "\n".join([f"{idx+1}. `{p}`" for idx, p in enumerate(fb_monitor.pages)])
             await status_msg.edit_text(
                 f"✅ **Successfully Added to Auto-Grab Monitor!**\n\n"
                 f"📘 **Page Name:** *{p_name}*\n"
                 f"🔗 **Page URL:** `{p_url}`\n\n"
-                f"Whenever a new video or reel is uploaded, it will be automatically delivered here in HD!\n\n"
+                f"Whenever a new video, reel, or photo is uploaded, it will be automatically delivered here in HD!\n\n"
                 f"📋 **Monitored Pages ({len(fb_monitor.pages)}):**\n{pages_list}"
             )
         else:
@@ -480,7 +514,6 @@ async def process_link(msg: Message):
             width = int(info.get("width")) if info.get("width") else None
             height = int(info.get("height")) if info.get("height") else None
 
-            # Enforce exact native display aspect ratio (prevents square crop)
             if not width or not height or not duration:
                 ew, eh, ed = fb_monitor.get_exact_video_dimensions(final_path)
                 width = width or ew or None
@@ -523,14 +556,40 @@ async def main():
     # Launch Facebook Monitor background loop
     monitor_task = asyncio.create_task(fb_monitor.start_loop())
 
-    logger.info("Starting Telegram long polling...")
-    await bot.delete_webhook(drop_pending_updates=True)
-    try:
-        await dp.start_polling(bot)
-    finally:
-        fb_monitor.stop()
-        monitor_task.cancel()
-        await web_runner.cleanup()
+    # Detect execution environment
+    render_url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("WEBHOOK_URL")
+    if not render_url and (os.getenv("RENDER") or os.getenv("PORT") == "8080"):
+        render_url = "https://fbdownloaderpagesbot.onrender.com"
+
+    force_polling = "--poll" in sys.argv or os.getenv("FORCE_POLLING", "").lower() in ("1", "true")
+
+    if render_url and not force_polling:
+        webhook_target = f"{render_url.rstrip('/')}/api/webhook"
+        logger.info(f"Configuring Telegram webhook for Render: {webhook_target}")
+        await bot.set_webhook(
+            url=webhook_target,
+            allowed_updates=["message"],
+            drop_pending_updates=True
+        )
+        logger.info(f"✅ Webhook successfully registered: {webhook_target}")
+        try:
+            # Keep process running while aiohttp handles webhooks & pings
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            pass
+        finally:
+            fb_monitor.stop()
+            monitor_task.cancel()
+            await web_runner.cleanup()
+    else:
+        logger.info("Starting Telegram long polling mode...")
+        await bot.delete_webhook(drop_pending_updates=True)
+        try:
+            await dp.start_polling(bot)
+        finally:
+            fb_monitor.stop()
+            monitor_task.cancel()
+            await web_runner.cleanup()
 
 
 if __name__ == "__main__":

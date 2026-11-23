@@ -25,8 +25,8 @@ except ImportError:
 logger = logging.getLogger("FacebookMonitor")
 
 DEFAULT_PAGES = [
-    "https://web.facebook.com/profile.php?id=61556328743295",
-    "https://web.facebook.com/profile.php?id=100083193627339",
+    "https://web.facebook.com/people/Paris-France-Tour/61556328743295/",
+    "https://web.facebook.com/people/FX-France-Express/100083193627339/",
     "https://web.facebook.com/lavialyon",
 ]
 
@@ -34,6 +34,66 @@ MAX_TELEGRAM_BYTES = 48 * 1024 * 1024       # 48 MB safe cap
 TARGET_COMPRESSED_BYTES = 44 * 1024 * 1024  # 44 MB compression target
 
 IMPERSONATE_PROFILES = ["chrome120", "chrome119", "safari17_0", "chrome110"]
+
+
+def resolve_facebook_page(input_str: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    Intelligently extracts Facebook page credentials from:
+    1. A video or reel link (detects creator page uploader_id and resolves canonical page URL)
+    2. A full Facebook Page URL (e.g. facebook.com/lavialyon or profile.php?id=...)
+    3. A Facebook username or handle (e.g. lavialyon or @lavialyon)
+    Returns (page_url, page_name, error_message)
+    """
+    text = input_str.strip()
+    if not text:
+        return None, None, "Input cannot be empty."
+
+    # 1. Check if input is a video or reel link
+    is_video_link = any(x in text.lower() for x in ["/reel/", "/videos/", "watch", "fb.watch", "/video.php"])
+    if is_video_link:
+        try:
+            ydl_opts = {"quiet": True, "no_warnings": True, "noplaylist": True}
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(text, download=False)
+                if info and "entries" in info and info["entries"]:
+                    info = info["entries"][0]
+                uid = info.get("uploader_id")
+                uploader_name = info.get("uploader")
+                if uid:
+                    page_url = f"https://web.facebook.com/profile.php?id={uid}"
+                    try:
+                        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0"}
+                        if HAS_CURL_CFFI:
+                            r = cffi_requests.get(page_url, impersonate="chrome120", allow_redirects=True, timeout=10)
+                        else:
+                            r = cffi_requests.get(page_url, headers=headers, allow_redirects=True, timeout=10)
+                        if r.status_code == 200 and "facebook.com" in r.url:
+                            clean_r_url = r.url.split("?")[0].rstrip("/")
+                            if not any(x in clean_r_url for x in ["/login", "/recover", "/help"]):
+                                page_url = clean_r_url
+                    except Exception:
+                        pass
+                    return page_url, uploader_name or "Facebook Creator", None
+        except Exception as e:
+            logger.warning(f"Could not extract uploader from video link: {e}")
+
+    # 2. Check if it's already a full Facebook URL
+    if "facebook.com" in text.lower():
+        clean_url = text.split("?")[0].rstrip("/")
+        if not clean_url.startswith("http"):
+            clean_url = "https://" + clean_url
+        name_guess = clean_url.rstrip("/").split("/")[-1]
+        if "profile.php" in clean_url:
+            name_guess = text.split("id=")[-1].split("&")[0] if "id=" in text else "Facebook Page"
+        return clean_url, name_guess, None
+
+    # 3. Check if it's a handle or username (e.g. @lavialyon or lavialyon)
+    clean_handle = text.lstrip("@").strip()
+    if re.match(r"^[a-zA-Z0-9._-]+$", clean_handle):
+        page_url = f"https://web.facebook.com/{clean_handle}"
+        return page_url, clean_handle, None
+
+    return None, None, f"Unrecognized Facebook page format: '{text}'"
 
 
 class FacebookMonitor:
@@ -54,9 +114,12 @@ class FacebookMonitor:
         self.seen_file = os.path.join(self.data_dir, "seen_posts.json")
         self.subscribers_file = os.path.join(self.data_dir, "subscribers.json")
         self.pages_file = os.path.join(self.data_dir, "monitored_pages.json")
+        self.initialized_pages_file = os.path.join(self.data_dir, "initialized_pages.json")
         
         self.seen_posts: Dict[str, dict] = self._load_json(self.seen_file, default={})
         self.subscribers: Set[int] = set(self._load_json(self.subscribers_file, default=[]))
+        self.initialized_pages: Set[str] = set(self._load_json(self.initialized_pages_file, default=[]))
+
         if self.target_chat_ids:
             self.subscribers.update(self.target_chat_ids)
             
@@ -87,7 +150,10 @@ class FacebookMonitor:
         except Exception as e:
             logger.error(f"Error saving {path}: {e}")
             if os.path.exists(temp_path):
-                os.remove(temp_path)
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
 
     def add_subscriber(self, chat_id: int):
         if chat_id not in self.subscribers:
@@ -106,6 +172,7 @@ class FacebookMonitor:
         if clean_url not in self.pages:
             self.pages.append(clean_url)
             self._save_json(self.pages_file, self.pages)
+            logger.info(f"Added new monitored page: {clean_url}")
             return True
         return False
 
@@ -115,7 +182,12 @@ class FacebookMonitor:
         if matched:
             for p in matched:
                 self.pages.remove(p)
+                p_key = p.strip().lower()
+                if p_key in self.initialized_pages:
+                    self.initialized_pages.remove(p_key)
             self._save_json(self.pages_file, self.pages)
+            self._save_json(self.initialized_pages_file, list(self.initialized_pages))
+            logger.info(f"Removed monitored page: {clean_url}")
             return True
         return False
 
@@ -132,11 +204,13 @@ class FacebookMonitor:
         return post_key in self.seen_posts
 
     # -------------------------------------------------------------------
-    # ANTI-BLOCK REQUEST DISPATCHER (TLS Impersonation + Random Jitter)
+    # ANTI-BLOCK REQUEST DISPATCHER (TLS Impersonation + Redirect Follower)
     # -------------------------------------------------------------------
     def _fetch_page_html(self, url: str) -> Tuple[Optional[str], Optional[str]]:
         """
         Fetches the Facebook page HTML using curl_cffi with browser impersonation.
+        Intelligently follows client-side meta-refresh and JS redirects to resolve
+        the canonical page HTML.
         Returns (html_text, final_resolved_url).
         """
         impersonate_choice = random.choice(IMPERSONATE_PROFILES)
@@ -159,7 +233,6 @@ class FacebookMonitor:
         cookies = {}
         if os.path.exists(cookies_file):
             try:
-                # Load netscape or simple cookies if available
                 with open(cookies_file, "r", encoding="utf-8") as f:
                     for line in f:
                         if line.startswith("#") or not line.strip():
@@ -180,15 +253,42 @@ class FacebookMonitor:
             if resp.status_code == 200:
                 self.consecutive_errors = 0
                 final_url = str(resp.url)
-                # If we were redirected to a canonical URL, update it for future requests
-                if final_url and final_url != url and "profile.php" in url and "people" in final_url:
-                    clean_final = final_url.split("?")[0]
-                    idx = self.pages.index(url) if url in self.pages else -1
-                    if idx != -1:
-                        self.pages[idx] = clean_final
-                        self._save_json(self.pages_file, self.pages)
-                        logger.info(f"Updated canonical page URL: {url} -> {clean_final}")
-                return resp.text, final_url
+
+                # Check if Facebook returned a client-side meta refresh or JS location replace
+                redirect_target = None
+                meta_match = re.search(r'<meta\s+http-equiv=["\']refresh["\']\s+content=["\'][0-9;\s]+url=([^"\'>]+)["\']', resp.text, re.IGNORECASE)
+                if meta_match:
+                    redirect_target = meta_match.group(1).replace("&amp;", "&").strip()
+                else:
+                    js_match = re.search(r'window\.location\.replace\(["\']([^"\']+)["\']\)', resp.text)
+                    if js_match:
+                        redirect_target = js_match.group(1).replace(r"\/", "/").strip()
+
+                if redirect_target and redirect_target != url:
+                    if redirect_target.startswith("/"):
+                        redirect_target = "https://web.facebook.com" + redirect_target
+                    logger.info(f"Following Facebook client redirect: {url} -> {redirect_target}")
+                    try:
+                        if HAS_CURL_CFFI:
+                            resp2 = session.get(redirect_target, headers=headers, cookies=cookies, timeout=20, allow_redirects=True)
+                        else:
+                            resp2 = cffi_requests.get(redirect_target, headers=headers, cookies=cookies, timeout=20, allow_redirects=True)
+                        if resp2.status_code == 200:
+                            final_redirect_url = str(resp2.url) if resp2.url else redirect_target
+                            clean_redirect = final_redirect_url.split("?")[0].rstrip("/")
+                            # Automatically update page list with canonical URL
+                            if url in self.pages:
+                                idx = self.pages.index(url)
+                                self.pages[idx] = clean_redirect
+                                self._save_json(self.pages_file, self.pages)
+                                logger.info(f"Updated page URL to canonical: {url} -> {clean_redirect}")
+                            return resp2.text, clean_redirect
+                    except Exception as re_err:
+                        logger.warning(f"Error following redirect target {redirect_target}: {re_err}")
+
+                clean_final = final_url.split("?")[0].rstrip("/")
+                return resp.text, clean_final
+
             elif resp.status_code in (429, 400):
                 logger.warning(f"Facebook returned rate limit / error code {resp.status_code} for {url}")
                 self.consecutive_errors += 1
@@ -206,10 +306,10 @@ class FacebookMonitor:
     # -------------------------------------------------------------------
     def _extract_posts_from_html(self, html: str, page_url: str) -> List[dict]:
         """
-        Scans all Relay / GraphQL <script type="application/json"> blocks inside
-        Facebook's HTML to locate posts, reels, videos, and photos.
+        Scans all Relay / GraphQL <script type="application/json"> blocks and raw
+        HTML inside Facebook's payload to locate posts, reels, videos, and photos.
+        Merges fragmented node properties and extracts canonical keys.
         """
-        scripts = re.findall(r'<script type="application/json"[^>]*>(.*?)</script>', html)
         discovered: Dict[str, dict] = {}
 
         # Derive page name if available
@@ -220,13 +320,32 @@ class FacebookMonitor:
             if raw_title and "log in" not in raw_title.lower() and "error" not in raw_title.lower():
                 page_name = raw_title
 
+        def find_image_uri(d):
+            if not isinstance(d, dict):
+                return None
+            for k in ["photo_image", "large_share_image", "image"]:
+                sub = d.get(k)
+                if isinstance(sub, dict) and sub.get("uri"):
+                    return sub["uri"]
+            for v in d.values():
+                if isinstance(v, dict):
+                    res = find_image_uri(v)
+                    if res:
+                        return res
+                elif isinstance(v, list):
+                    for it in v:
+                        if isinstance(it, dict):
+                            res = find_image_uri(it)
+                            if res:
+                                return res
+            return None
+
         def parse_recursive(obj):
             if isinstance(obj, dict):
                 permalink = obj.get("permalink_url") or obj.get("url")
                 post_id = obj.get("post_id") or obj.get("id")
                 creation_time = obj.get("creation_time")
                 
-                # Check for message / caption
                 text = ""
                 message_obj = obj.get("message")
                 if isinstance(message_obj, dict):
@@ -234,32 +353,33 @@ class FacebookMonitor:
                 elif isinstance(message_obj, str):
                     text = message_obj
 
-                # Detect if it's a media post
                 if permalink and isinstance(permalink, str):
-                    # Clean URL query params like ?comment_id=...
                     clean_link = permalink.split("?")[0].rstrip("/")
-                    
                     is_reel = "/reel/" in clean_link
                     is_video = "/videos/" in clean_link or "watch" in clean_link
-                    is_photo = "/photo.php" in permalink or "/posts/" in clean_link or "/photos/" in clean_link
+                    is_photo = ("/photo.php" in permalink and ("fbid=" in permalink or post_id)) or "/posts/" in clean_link or "/photos/" in clean_link
 
                     if is_reel or is_video or is_photo:
-                        key = str(post_id) if post_id else clean_link
+                        # Derive canonical unique identity key
+                        canon_key = clean_link
+                        reel_m = re.search(r"/reel/(\d+)", clean_link)
+                        vid_m = re.search(r"/videos/(\d+)", clean_link)
+                        post_m = re.search(r"/posts/([a-zA-Z0-9_]+)", clean_link)
                         
-                        # Find photo url if photo post
-                        photo_url = None
-                        if is_photo:
-                            attachments = obj.get("attachments") or []
-                            for att in attachments:
-                                media = att.get("media") or {}
-                                image = media.get("image") or {}
-                                if image.get("uri"):
-                                    photo_url = image.get("uri")
-                                    break
+                        if reel_m:
+                            canon_key = f"reel_{reel_m.group(1)}"
+                        elif vid_m:
+                            canon_key = f"video_{vid_m.group(1)}"
+                        elif post_m:
+                            canon_key = f"post_{post_m.group(1)}"
+                        elif post_id:
+                            canon_key = str(post_id)
 
-                        if key not in discovered:
-                            discovered[key] = {
-                                "id": key,
+                        photo_url = find_image_uri(obj)
+
+                        if canon_key not in discovered:
+                            discovered[canon_key] = {
+                                "id": canon_key,
                                 "url": permalink,
                                 "clean_url": clean_link,
                                 "type": "video" if (is_reel or is_video) else "photo",
@@ -269,6 +389,17 @@ class FacebookMonitor:
                                 "page_url": page_url,
                                 "photo_url": photo_url,
                             }
+                        else:
+                            # Merge richer attributes
+                            existing = discovered[canon_key]
+                            if not existing.get("title") and text:
+                                existing["title"] = text
+                            if not existing.get("creation_time") and creation_time:
+                                existing["creation_time"] = creation_time
+                            if not existing.get("photo_url") and photo_url:
+                                existing["photo_url"] = photo_url
+                            if existing.get("page_name") in ("Facebook Page", "") and page_name not in ("Facebook Page", ""):
+                                existing["page_name"] = page_name
 
                 for v in obj.values():
                     parse_recursive(v)
@@ -276,6 +407,7 @@ class FacebookMonitor:
                 for item in obj:
                     parse_recursive(item)
 
+        scripts = re.findall(r'<script type="application/json"[^>]*>(.*?)</script>', html)
         for scr in scripts:
             try:
                 data = json.loads(scr)
@@ -283,7 +415,40 @@ class FacebookMonitor:
             except Exception:
                 continue
 
-        # Sort posts by creation time descending if available
+        # Direct regex fallback: scan HTML for reels and posts
+        for reel_match in re.finditer(r'href=["\'](?:https?://(?:www\.|web\.)?facebook\.com)?/reel/(\d+)[^"\']*["\']', html):
+            rid = reel_match.group(1)
+            c_key = f"reel_{rid}"
+            if c_key not in discovered:
+                discovered[c_key] = {
+                    "id": c_key,
+                    "url": f"https://web.facebook.com/reel/{rid}/",
+                    "clean_url": f"https://web.facebook.com/reel/{rid}",
+                    "type": "video",
+                    "title": "",
+                    "creation_time": None,
+                    "page_name": page_name,
+                    "page_url": page_url,
+                    "photo_url": None,
+                }
+
+        for post_match in re.finditer(r'href=["\'](https?://(?:www\.|web\.)?facebook\.com/[^/]+/posts/(pfbid[a-zA-Z0-9]+))[^"\']*["\']', html):
+            p_full = post_match.group(1)
+            p_id = post_match.group(2)
+            c_key = f"post_{p_id}"
+            if c_key not in discovered:
+                discovered[c_key] = {
+                    "id": c_key,
+                    "url": p_full,
+                    "clean_url": p_full,
+                    "type": "photo",
+                    "title": "",
+                    "creation_time": None,
+                    "page_name": page_name,
+                    "page_url": page_url,
+                    "photo_url": None,
+                }
+
         result = list(discovered.values())
         result.sort(key=lambda x: int(x.get("creation_time") or 0), reverse=True)
         return result
@@ -384,30 +549,32 @@ class FacebookMonitor:
             logger.warning(f"ffprobe dimension check warning: {e}")
         return w, h, dur
 
-    async def _download_and_broadcast(self, post: dict):
+    async def _download_and_broadcast(self, post: dict) -> bool:
         """
         Downloads the media and sends it to all subscribers.
+        Returns True if delivered successfully to at least one subscriber, False otherwise.
         """
         if not self.subscribers:
             logger.warning("No subscriber chat IDs registered to receive media. Run /start in the bot chat.")
-            return
+            return False
 
         post_url = post["url"]
         post_type = post["type"]
         page_name = post["page_name"]
         raw_caption = post.get("title") or ""
 
-        # Construct informative caption
         caption_lines = [
             f"🔔 **New {post_type.capitalize()} Uploaded!**",
             f"📘 **Page:** {page_name}",
         ]
         if raw_caption:
-            caption_lines.append(f"📌 {raw_caption[:200]}")
+            caption_lines.append(f"📌 {raw_caption[:280]}")
         caption_lines.append(f"\n🔗 [Original Link]({post_url})")
         caption_text = "\n".join(caption_lines)
 
+        delivered = False
         temp_dir = tempfile.mkdtemp(prefix="fb_download_")
+
         try:
             if post_type == "video":
                 video_path, thumb_path, info = await asyncio.to_thread(
@@ -415,7 +582,7 @@ class FacebookMonitor:
                 )
                 if not video_path or not os.path.exists(video_path):
                     logger.error(f"Failed to download video from {post_url}")
-                    return
+                    return False
 
                 size = os.path.getsize(video_path)
                 if size > (50 * 1024 * 1024):
@@ -426,16 +593,16 @@ class FacebookMonitor:
                                 chat_id,
                                 f"⚠️ New video on **{page_name}** exceeds Telegram's 50 MB limit.\n\n🔗 Watch here: {post_url}"
                             )
+                            delivered = True
                         except Exception as ce:
                             logger.error(f"Send warning error to {chat_id}: {ce}")
-                    return
+                    return delivered
 
                 thumb_input = FSInputFile(thumb_path) if thumb_path and os.path.exists(thumb_path) else None
                 duration = int(info.get("duration", 0)) if info.get("duration") else None
                 width = int(info.get("width")) if info.get("width") else None
                 height = int(info.get("height")) if info.get("height") else None
 
-                # Fallback to direct inspection to guarantee exact native aspect ratio
                 if not width or not height or not duration:
                     exact_w, exact_h, exact_dur = self.get_exact_video_dimensions(video_path)
                     width = width or exact_w or 1080
@@ -457,27 +624,67 @@ class FacebookMonitor:
                             supports_streaming=True
                         )
                         logger.info(f"Delivered video to chat {chat_id} from {page_name}")
+                        delivered = True
                     except Exception as e:
                         logger.error(f"Error sending video to {chat_id}: {e}")
 
             elif post_type == "photo":
-                photo_target = post.get("photo_url") or post_url
-                # Try downloading photo
-                img_path = os.path.join(temp_dir, "photo.jpg")
-                if post.get("photo_url"):
-                    import requests
-                    r = requests.get(post["photo_url"], timeout=15)
-                    with open(img_path, "wb") as pf:
-                        pf.write(r.content)
-                else:
-                    # Use yt-dlp to extract image
-                    ydl_opts = {"outtmpl": os.path.join(temp_dir, "photo.%(ext)s"), "quiet": True}
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        ydl.download([post_url])
-                    downloaded = [os.path.join(temp_dir, f) for f in os.listdir(temp_dir) if os.path.isfile(os.path.join(temp_dir, f))]
-                    img_path = downloaded[0] if downloaded else None
+                photo_cdn_url = post.get("photo_url")
+                # If direct photo URL is not yet known, scrape og:image from post webpage
+                if not photo_cdn_url:
+                    try:
+                        p_html, _ = await asyncio.to_thread(self._fetch_page_html, post_url)
+                        if p_html:
+                            og_m = re.search(r'<meta\s+property=["\']og:image["\']\s+content=["\']([^"\']+)["\']', p_html)
+                            if og_m:
+                                photo_cdn_url = og_m.group(1).replace("&amp;", "&")
+                            if not raw_caption:
+                                desc_m = re.search(r'<meta\s+property=["\']og:description["\']\s+content=["\']([^"\']+)["\']', p_html)
+                                if desc_m:
+                                    raw_caption = desc_m.group(1).replace("&amp;", "&")
+                                    caption_lines = [
+                                        f"🔔 **New Photo Uploaded!**",
+                                        f"📘 **Page:** {page_name}",
+                                        f"📌 {raw_caption[:280]}",
+                                        f"\n🔗 [Original Link]({post_url})"
+                                    ]
+                                    caption_text = "\n".join(caption_lines)
+                    except Exception as pe:
+                        logger.warning(f"Error extracting photo og:image for {post_url}: {pe}")
 
-                if img_path and os.path.exists(img_path):
+                img_path = os.path.join(temp_dir, f"photo_{uuid.uuid4().hex[:6]}.jpg")
+                photo_ok = False
+
+                if photo_cdn_url:
+                    try:
+                        import requests
+                        r = await asyncio.to_thread(
+                            requests.get,
+                            photo_cdn_url,
+                            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0"},
+                            timeout=20
+                        )
+                        if r.status_code == 200 and len(r.content) > 1000:
+                            with open(img_path, "wb") as pf:
+                                pf.write(r.content)
+                            photo_ok = True
+                    except Exception as de:
+                        logger.warning(f"Direct photo download error: {de}")
+
+                if not photo_ok:
+                    # Fallback to yt-dlp image download
+                    try:
+                        ydl_opts = {"outtmpl": os.path.join(temp_dir, "photo.%(ext)s"), "quiet": True}
+                        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                            await asyncio.to_thread(ydl.download, [post_url])
+                        downloaded = [os.path.join(temp_dir, f) for f in os.listdir(temp_dir) if os.path.isfile(os.path.join(temp_dir, f))]
+                        if downloaded:
+                            img_path = downloaded[0]
+                            photo_ok = True
+                    except Exception:
+                        pass
+
+                if photo_ok and os.path.exists(img_path):
                     for chat_id in list(self.subscribers):
                         try:
                             photo_input = FSInputFile(img_path)
@@ -488,13 +695,18 @@ class FacebookMonitor:
                                 parse_mode="Markdown"
                             )
                             logger.info(f"Delivered photo to chat {chat_id} from {page_name}")
+                            delivered = True
                         except Exception as e:
                             logger.error(f"Error sending photo to {chat_id}: {e}")
+                else:
+                    logger.error(f"Failed to obtain photo file for {post_url}")
 
         except Exception as e:
             logger.error(f"Error in media download & broadcast: {e}")
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
+
+        return delivered
 
     # -------------------------------------------------------------------
     # SINGLE CHECK PASS OVER ALL PAGES
@@ -502,7 +714,8 @@ class FacebookMonitor:
     async def check_pages_once(self, announce_empty: bool = False) -> int:
         """
         Runs one polite check cycle across all configured Facebook pages.
-        Returns total number of new posts discovered.
+        Accurately detects new uploads, seeds baseline per-page, and delivers media.
+        Returns total number of new posts discovered & delivered.
         """
         if self.is_checking:
             logger.info("A check pass is already in progress, skipping duplicate call.")
@@ -515,24 +728,35 @@ class FacebookMonitor:
         try:
             logger.info(f"Starting check pass over {len(self.pages)} pages...")
             
-            for page_url in self.pages:
+            for page_url in list(self.pages):
                 logger.info(f"Checking Facebook page: {page_url}")
                 html, final_url = await asyncio.to_thread(self._fetch_page_html, page_url)
                 
                 if not html:
                     logger.warning(f"Could not retrieve HTML for {page_url}")
-                    # Stagger delay before next page
-                    await asyncio.sleep(random.uniform(5, 10))
+                    await asyncio.sleep(random.uniform(4, 8))
                     continue
 
                 posts = self._extract_posts_from_html(html, page_url)
                 logger.info(f"Found {len(posts)} posts/reels in payload for {page_url}")
 
-                # If it's the very first time running and seen_posts is empty,
-                # mark existing posts as seen to avoid flooding historical content,
-                # unless explicitly desired.
-                first_run = len(self.seen_posts) == 0
-                
+                page_key = page_url.strip().lower()
+                final_key = (final_url or "").strip().lower()
+                is_uninitialized = (page_key not in self.initialized_pages and (not final_key or final_key not in self.initialized_pages))
+
+                if is_uninitialized:
+                    # Seed baseline for this newly added page without spamming historical posts
+                    logger.info(f"Page {page_url} has not been initialized yet. Recording baseline of {len(posts)} existing posts.")
+                    for post in posts:
+                        self.mark_seen(post["id"], post)
+                        self.mark_seen(post["clean_url"], post)
+                    self.initialized_pages.add(page_key)
+                    if final_key:
+                        self.initialized_pages.add(final_key)
+                    self._save_json(self.initialized_pages_file, list(self.initialized_pages))
+                    await asyncio.sleep(random.uniform(4, 8))
+                    continue
+
                 for post in posts:
                     post_key = post["id"]
                     clean_url = post["clean_url"]
@@ -540,31 +764,25 @@ class FacebookMonitor:
                     if self.is_seen(post_key) or self.is_seen(clean_url):
                         continue
 
-                    if first_run:
-                        # Record baseline without spamming
-                        logger.info(f"Baseline post recorded: {post['clean_url']}")
-                        self.mark_seen(post_key, post)
-                        self.mark_seen(clean_url, post)
-                        continue
-
                     # NEW POST DETECTED!
                     logger.info(f"🔥 NEW UPLOAD DETECTED: {post['clean_url']} ({post['type']})")
-                    self.mark_seen(post_key, post)
-                    self.mark_seen(clean_url, post)
-                    new_items_count += 1
+                    delivered = await self._download_and_broadcast(post)
+                    if delivered:
+                        self.mark_seen(post_key, post)
+                        self.mark_seen(clean_url, post)
+                        new_items_count += 1
+                    else:
+                        logger.warning(f"Failed to deliver {clean_url}, will retry in next cycle.")
 
-                    # Download & send directly to the Telegram bot chat
-                    await self._download_and_broadcast(post)
-
-                # Polite delay between consecutive pages to avoid pattern detection
-                await asyncio.sleep(random.uniform(6.0, 14.0))
+                # Polite delay between consecutive pages
+                await asyncio.sleep(random.uniform(5.0, 10.0))
 
         except Exception as e:
             logger.error(f"Error during check cycle: {e}")
         finally:
             self.is_checking = False
 
-        logger.info(f"Check pass completed. Discovered {new_items_count} new posts.")
+        logger.info(f"Check pass completed. Discovered & delivered {new_items_count} new posts.")
         return new_items_count
 
     # -------------------------------------------------------------------
@@ -574,26 +792,24 @@ class FacebookMonitor:
         """
         Continuous polite background loop.
         Automatically avoids Facebook bot blocks by:
-        - Introducing ±60s random jitter between checks.
+        - Introducing ±45s random jitter between checks.
         - Backing off exponentially if Facebook throttles (consecutive_errors).
         """
         self.running = True
         logger.info("Facebook auto-checker loop started.")
         
-        # Initial check after 10s warmup
-        await asyncio.sleep(10)
+        # Initial check after 8s warmup
+        await asyncio.sleep(8)
         await self.check_pages_once()
 
         while self.running:
             try:
-                # Calculate sleep duration with jitter
-                jitter = random.uniform(-45.0, 75.0)
+                jitter = random.uniform(-30.0, 60.0)
                 current_interval = self.check_interval + jitter
 
-                # Exponential backoff if consecutive errors occurred
                 if self.consecutive_errors > 0:
                     backoff_multiplier = min(self.consecutive_errors, 5)
-                    backoff_delay = backoff_multiplier * 300  # up to 25 mins backoff
+                    backoff_delay = backoff_multiplier * 300
                     logger.warning(
                         f"Backing off for {backoff_delay}s due to {self.consecutive_errors} consecutive errors."
                     )
