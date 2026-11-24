@@ -36,6 +36,12 @@ TARGET_COMPRESSED_BYTES = 44 * 1024 * 1024  # 44 MB compression target
 IMPERSONATE_PROFILES = ["chrome120", "chrome119", "safari17_0", "chrome110"]
 
 
+def normalize_page_url(u: str) -> str:
+    clean = u.strip().rstrip("/")
+    clean = clean.replace("http://", "https://").replace("https://www.", "https://web.")
+    return clean
+
+
 def resolve_facebook_page(input_str: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """
     Intelligently extracts Facebook page credentials from:
@@ -69,7 +75,7 @@ def resolve_facebook_page(input_str: str) -> Tuple[Optional[str], Optional[str],
                             r = cffi_requests.get(page_url, headers=headers, allow_redirects=True, timeout=10)
                         if r.status_code == 200 and "facebook.com" in r.url:
                             clean_r_url = r.url.split("?")[0].rstrip("/")
-                            if not any(x in clean_r_url for x in ["/login", "/recover", "/help"]):
+                            if not any(x in clean_r_url for x in ["/login", "/recover", "/help", "checkpoint"]):
                                 page_url = clean_r_url
                     except Exception:
                         pass
@@ -108,7 +114,6 @@ class FacebookMonitor:
         self.bot = bot
         self.data_dir = data_dir
         self.check_interval = max(60, check_interval)
-        self.pages = list(pages or DEFAULT_PAGES)
         self.target_chat_ids = set(target_chat_ids or [])
         
         self.seen_file = os.path.join(self.data_dir, "seen_posts.json")
@@ -123,9 +128,35 @@ class FacebookMonitor:
         if self.target_chat_ids:
             self.subscribers.update(self.target_chat_ids)
             
-        saved_pages = self._load_json(self.pages_file, default=None)
-        if saved_pages and isinstance(saved_pages, list):
-            self.pages = saved_pages
+        raw_saved_pages = self._load_json(self.pages_file, default=None)
+        candidate_pages = list(pages or DEFAULT_PAGES)
+        if raw_saved_pages and isinstance(raw_saved_pages, list):
+            for sp in raw_saved_pages:
+                if sp and sp not in candidate_pages:
+                    candidate_pages.append(sp)
+
+        # Sanitize pages: remove any corrupted /login, /checkpoint URLs and deduplicate
+        seen_canon = set()
+        cleaned_pages = []
+        for p in candidate_pages:
+            if not isinstance(p, str) or not p.strip():
+                continue
+            if any(x in p.lower() for x in ["/login", "/checkpoint", "/recover", "/help", "facebook.com/login"]):
+                continue
+            norm = normalize_page_url(p)
+            if norm not in seen_canon:
+                seen_canon.add(norm)
+                cleaned_pages.append(p.strip())
+
+        # Guarantee DEFAULT_PAGES are always present
+        for dp in DEFAULT_PAGES:
+            norm_dp = normalize_page_url(dp)
+            if norm_dp not in seen_canon:
+                seen_canon.add(norm_dp)
+                cleaned_pages.append(dp)
+
+        self.pages = cleaned_pages
+        self._save_json(self.pages_file, self.pages)
 
         self.last_check_time: Optional[float] = None
         self.is_checking: bool = False
@@ -169,20 +200,22 @@ class FacebookMonitor:
 
     def add_page(self, page_url: str) -> bool:
         clean_url = page_url.strip()
-        if clean_url not in self.pages:
-            self.pages.append(clean_url)
-            self._save_json(self.pages_file, self.pages)
-            logger.info(f"Added new monitored page: {clean_url}")
-            return True
-        return False
+        norm_new = normalize_page_url(clean_url)
+        for p in self.pages:
+            if normalize_page_url(p) == norm_new:
+                return False
+        self.pages.append(clean_url)
+        self._save_json(self.pages_file, self.pages)
+        logger.info(f"Added new monitored page: {clean_url}")
+        return True
 
     def remove_page(self, page_url: str) -> bool:
         clean_url = page_url.strip()
-        matched = [p for p in self.pages if clean_url in p]
+        matched = [p for p in self.pages if clean_url.lower() in p.lower()]
         if matched:
             for p in matched:
                 self.pages.remove(p)
-                p_key = p.strip().lower()
+                p_key = normalize_page_url(p).lower()
                 if p_key in self.initialized_pages:
                     self.initialized_pages.remove(p_key)
             self._save_json(self.pages_file, self.pages)
@@ -203,14 +236,33 @@ class FacebookMonitor:
     def is_seen(self, post_key: str) -> bool:
         return post_key in self.seen_posts
 
+    def get_target_endpoints(self, page_url: str) -> List[str]:
+        """
+        Returns both the main page feed and the reels tab for any page URL
+        so both standard video/photo posts and creator reels are monitored.
+        """
+        clean = page_url.strip().rstrip("/")
+        id_m = re.search(r"id=(\d+)", clean) or re.search(r"/people/[^/]+/(\d+)", clean)
+        if id_m:
+            uid = id_m.group(1)
+            return [
+                f"https://web.facebook.com/profile.php?id={uid}",
+                f"https://web.facebook.com/profile.php?id={uid}&sk=reels_tab",
+            ]
+        else:
+            return [
+                f"{clean}/",
+                f"{clean}/reels_tab/",
+            ]
+
     # -------------------------------------------------------------------
-    # ANTI-BLOCK REQUEST DISPATCHER (TLS Impersonation + Redirect Follower)
+    # ANTI-BLOCK REQUEST DISPATCHER (TLS Impersonation + Safe Redirects)
     # -------------------------------------------------------------------
     def _fetch_page_html(self, url: str) -> Tuple[Optional[str], Optional[str]]:
         """
         Fetches the Facebook page HTML using curl_cffi with browser impersonation.
-        Intelligently follows client-side meta-refresh and JS redirects to resolve
-        the canonical page HTML.
+        Intelligently follows safe client-side meta-refresh and JS redirects while
+        strictly rejecting auth/login redirects to protect the page catalog.
         Returns (html_text, final_resolved_url).
         """
         impersonate_choice = random.choice(IMPERSONATE_PROFILES)
@@ -246,9 +298,9 @@ class FacebookMonitor:
         try:
             if HAS_CURL_CFFI:
                 session = cffi_requests.Session(impersonate=impersonate_choice)
-                resp = session.get(url, headers=headers, cookies=cookies, timeout=20, allow_redirects=True)
+                resp = session.get(url, headers=headers, cookies=cookies, timeout=25, allow_redirects=True)
             else:
-                resp = cffi_requests.get(url, headers=headers, cookies=cookies, timeout=20, allow_redirects=True)
+                resp = cffi_requests.get(url, headers=headers, cookies=cookies, timeout=25, allow_redirects=True)
 
             if resp.status_code == 200:
                 self.consecutive_errors = 0
@@ -267,27 +319,26 @@ class FacebookMonitor:
                 if redirect_target and redirect_target != url:
                     if redirect_target.startswith("/"):
                         redirect_target = "https://web.facebook.com" + redirect_target
+
+                    # Reject auth/login redirects
+                    if any(x in redirect_target.lower() for x in ["/login", "/checkpoint", "/recover", "/help", "facebook.com/login"]):
+                        logger.warning(f"Facebook returned auth/login redirect for {url}. Ignoring redirect.")
+                        return None, None
+
                     logger.info(f"Following Facebook client redirect: {url} -> {redirect_target}")
                     try:
                         if HAS_CURL_CFFI:
-                            resp2 = session.get(redirect_target, headers=headers, cookies=cookies, timeout=20, allow_redirects=True)
+                            resp2 = session.get(redirect_target, headers=headers, cookies=cookies, timeout=25, allow_redirects=True)
                         else:
-                            resp2 = cffi_requests.get(redirect_target, headers=headers, cookies=cookies, timeout=20, allow_redirects=True)
+                            resp2 = cffi_requests.get(redirect_target, headers=headers, cookies=cookies, timeout=25, allow_redirects=True)
                         if resp2.status_code == 200:
                             final_redirect_url = str(resp2.url) if resp2.url else redirect_target
-                            clean_redirect = final_redirect_url.split("?")[0].rstrip("/")
-                            # Automatically update page list with canonical URL
-                            if url in self.pages:
-                                idx = self.pages.index(url)
-                                self.pages[idx] = clean_redirect
-                                self._save_json(self.pages_file, self.pages)
-                                logger.info(f"Updated page URL to canonical: {url} -> {clean_redirect}")
-                            return resp2.text, clean_redirect
+                            if not any(x in final_redirect_url.lower() for x in ["/login", "/checkpoint", "/recover", "/help"]):
+                                return resp2.text, final_redirect_url
                     except Exception as re_err:
                         logger.warning(f"Error following redirect target {redirect_target}: {re_err}")
 
-                clean_final = final_url.split("?")[0].rstrip("/")
-                return resp.text, clean_final
+                return resp.text, final_url
 
             elif resp.status_code in (429, 400):
                 logger.warning(f"Facebook returned rate limit / error code {resp.status_code} for {url}")
@@ -306,7 +357,7 @@ class FacebookMonitor:
     # -------------------------------------------------------------------
     def _extract_posts_from_html(self, html: str, page_url: str) -> List[dict]:
         """
-        Scans all Relay / GraphQL <script type="application/json"> blocks and raw
+        Scans Relay / GraphQL <script type="application/json"> blocks and raw
         HTML inside Facebook's payload to locate posts, reels, videos, and photos.
         Merges fragmented node properties and extracts canonical keys.
         """
@@ -346,60 +397,76 @@ class FacebookMonitor:
                 post_id = obj.get("post_id") or obj.get("id")
                 creation_time = obj.get("creation_time")
                 
+                # Check for message / caption across GraphQL fields
                 text = ""
-                message_obj = obj.get("message")
-                if isinstance(message_obj, dict):
-                    text = message_obj.get("text", "")
-                elif isinstance(message_obj, str):
-                    text = message_obj
+                for msg_key in ["message", "video_caption", "story_message", "caption", "text"]:
+                    if msg_key in obj:
+                        val = obj[msg_key]
+                        if isinstance(val, dict):
+                            text = val.get("text", "") or val.get("caption", "")
+                        elif isinstance(val, str):
+                            text = val
+                        if text:
+                            break
 
                 if permalink and isinstance(permalink, str):
                     clean_link = permalink.split("?")[0].rstrip("/")
                     is_reel = "/reel/" in clean_link
-                    is_video = "/videos/" in clean_link or "watch" in clean_link
+                    is_video = "/videos/" in clean_link or "watch" in clean_link or "?v=" in permalink
                     is_photo = ("/photo.php" in permalink and ("fbid=" in permalink or post_id)) or "/posts/" in clean_link or "/photos/" in clean_link
 
                     if is_reel or is_video or is_photo:
-                        # Derive canonical unique identity key
-                        canon_key = clean_link
                         reel_m = re.search(r"/reel/(\d+)", clean_link)
-                        vid_m = re.search(r"/videos/(\d+)", clean_link)
+                        vid_m = re.search(r"/videos/(\d+)", clean_link) or re.search(r"[?&]v=(\d+)", permalink)
                         post_m = re.search(r"/posts/([a-zA-Z0-9_]+)", clean_link)
-                        
+                        fbid_m = re.search(r"[?&]fbid=(\d+)", permalink)
+
                         if reel_m:
                             canon_key = f"reel_{reel_m.group(1)}"
+                            clean_link = f"https://web.facebook.com/reel/{reel_m.group(1)}"
+                            post_type = "video"
                         elif vid_m:
                             canon_key = f"video_{vid_m.group(1)}"
+                            clean_link = f"https://web.facebook.com/watch/?v={vid_m.group(1)}"
+                            post_type = "video"
                         elif post_m:
                             canon_key = f"post_{post_m.group(1)}"
-                        elif post_id:
-                            canon_key = str(post_id)
-
-                        photo_url = find_image_uri(obj)
-
-                        if canon_key not in discovered:
-                            discovered[canon_key] = {
-                                "id": canon_key,
-                                "url": permalink,
-                                "clean_url": clean_link,
-                                "type": "video" if (is_reel or is_video) else "photo",
-                                "title": text,
-                                "creation_time": creation_time,
-                                "page_name": page_name,
-                                "page_url": page_url,
-                                "photo_url": photo_url,
-                            }
+                            post_type = "photo"
+                        elif fbid_m:
+                            canon_key = f"photo_{fbid_m.group(1)}"
+                            clean_link = f"https://web.facebook.com/photo.php?fbid={fbid_m.group(1)}"
+                            post_type = "photo"
+                        elif post_id and str(post_id).isdigit():
+                            canon_key = f"id_{post_id}"
+                            post_type = "video" if (is_reel or is_video) else "photo"
                         else:
-                            # Merge richer attributes
-                            existing = discovered[canon_key]
-                            if not existing.get("title") and text:
-                                existing["title"] = text
-                            if not existing.get("creation_time") and creation_time:
-                                existing["creation_time"] = creation_time
-                            if not existing.get("photo_url") and photo_url:
-                                existing["photo_url"] = photo_url
-                            if existing.get("page_name") in ("Facebook Page", "") and page_name not in ("Facebook Page", ""):
-                                existing["page_name"] = page_name
+                            canon_key = None
+
+                        if canon_key and not clean_link.endswith("/photo.php"):
+                            photo_url = find_image_uri(obj)
+
+                            if canon_key not in discovered:
+                                discovered[canon_key] = {
+                                    "id": canon_key,
+                                    "url": permalink,
+                                    "clean_url": clean_link,
+                                    "type": post_type,
+                                    "title": text,
+                                    "creation_time": creation_time,
+                                    "page_name": page_name,
+                                    "page_url": page_url,
+                                    "photo_url": photo_url,
+                                }
+                            else:
+                                existing = discovered[canon_key]
+                                if not existing.get("title") and text:
+                                    existing["title"] = text
+                                if not existing.get("creation_time") and creation_time:
+                                    existing["creation_time"] = creation_time
+                                if not existing.get("photo_url") and photo_url:
+                                    existing["photo_url"] = photo_url
+                                if existing.get("page_name") in ("Facebook Page", "") and page_name not in ("Facebook Page", ""):
+                                    existing["page_name"] = page_name
 
                 for v in obj.values():
                     parse_recursive(v)
@@ -415,7 +482,7 @@ class FacebookMonitor:
             except Exception:
                 continue
 
-        # Direct regex fallback: scan HTML for reels and posts
+        # Regex scan raw HTML for reels and posts
         for reel_match in re.finditer(r'href=["\'](?:https?://(?:www\.|web\.)?facebook\.com)?/reel/(\d+)[^"\']*["\']', html):
             rid = reel_match.group(1)
             c_key = f"reel_{rid}"
@@ -563,15 +630,6 @@ class FacebookMonitor:
         page_name = post["page_name"]
         raw_caption = post.get("title") or ""
 
-        caption_lines = [
-            f"🔔 **New {post_type.capitalize()} Uploaded!**",
-            f"📘 **Page:** {page_name}",
-        ]
-        if raw_caption:
-            caption_lines.append(f"📌 {raw_caption[:280]}")
-        caption_lines.append(f"\n🔗 [Original Link]({post_url})")
-        caption_text = "\n".join(caption_lines)
-
         delivered = False
         temp_dir = tempfile.mkdtemp(prefix="fb_download_")
 
@@ -583,6 +641,25 @@ class FacebookMonitor:
                 if not video_path or not os.path.exists(video_path):
                     logger.error(f"Failed to download video from {post_url}")
                     return False
+
+                # Extract rich title from yt-dlp if raw_caption was missing
+                if not raw_caption or len(raw_caption) < 5:
+                    yt_title = info.get("title") or info.get("description") or ""
+                    if "|" in yt_title:
+                        parts = [p.strip() for p in yt_title.split("|")]
+                        valid_parts = [p for p in parts if not any(k in p.lower() for k in ["views", "reactions", "shares", "followers"])]
+                        raw_caption = valid_parts[0] if valid_parts else parts[0]
+                    elif yt_title:
+                        raw_caption = yt_title
+
+                caption_lines = [
+                    f"🔔 **New {post_type.capitalize()} Uploaded!**",
+                    f"📘 **Page:** {page_name}",
+                ]
+                if raw_caption:
+                    caption_lines.append(f"📌 {raw_caption[:280]}")
+                caption_lines.append(f"\n🔗 [Original Link]({post_url})")
+                caption_text = "\n".join(caption_lines)
 
                 size = os.path.getsize(video_path)
                 if size > (50 * 1024 * 1024):
@@ -630,7 +707,6 @@ class FacebookMonitor:
 
             elif post_type == "photo":
                 photo_cdn_url = post.get("photo_url")
-                # If direct photo URL is not yet known, scrape og:image from post webpage
                 if not photo_cdn_url:
                     try:
                         p_html, _ = await asyncio.to_thread(self._fetch_page_html, post_url)
@@ -642,15 +718,17 @@ class FacebookMonitor:
                                 desc_m = re.search(r'<meta\s+property=["\']og:description["\']\s+content=["\']([^"\']+)["\']', p_html)
                                 if desc_m:
                                     raw_caption = desc_m.group(1).replace("&amp;", "&")
-                                    caption_lines = [
-                                        f"🔔 **New Photo Uploaded!**",
-                                        f"📘 **Page:** {page_name}",
-                                        f"📌 {raw_caption[:280]}",
-                                        f"\n🔗 [Original Link]({post_url})"
-                                    ]
-                                    caption_text = "\n".join(caption_lines)
                     except Exception as pe:
                         logger.warning(f"Error extracting photo og:image for {post_url}: {pe}")
+
+                caption_lines = [
+                    f"🔔 **New Photo Uploaded!**",
+                    f"📘 **Page:** {page_name}",
+                ]
+                if raw_caption:
+                    caption_lines.append(f"📌 {raw_caption[:280]}")
+                caption_lines.append(f"\n🔗 [Original Link]({post_url})")
+                caption_text = "\n".join(caption_lines)
 
                 img_path = os.path.join(temp_dir, f"photo_{uuid.uuid4().hex[:6]}.jpg")
                 photo_ok = False
@@ -672,7 +750,6 @@ class FacebookMonitor:
                         logger.warning(f"Direct photo download error: {de}")
 
                 if not photo_ok:
-                    # Fallback to yt-dlp image download
                     try:
                         ydl_opts = {"outtmpl": os.path.join(temp_dir, "photo.%(ext)s"), "quiet": True}
                         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -714,7 +791,7 @@ class FacebookMonitor:
     async def check_pages_once(self, announce_empty: bool = False) -> int:
         """
         Runs one polite check cycle across all configured Facebook pages.
-        Accurately detects new uploads, seeds baseline per-page, and delivers media.
+        Accurately monitors both main feed and reels tab for each page.
         Returns total number of new posts discovered & delivered.
         """
         if self.is_checking:
@@ -730,22 +807,44 @@ class FacebookMonitor:
             
             for page_url in list(self.pages):
                 logger.info(f"Checking Facebook page: {page_url}")
-                html, final_url = await asyncio.to_thread(self._fetch_page_html, page_url)
-                
-                if not html:
-                    logger.warning(f"Could not retrieve HTML for {page_url}")
-                    await asyncio.sleep(random.uniform(4, 8))
-                    continue
+                endpoints = self.get_target_endpoints(page_url)
+                discovered_for_page: Dict[str, dict] = {}
+                resolved_final_url = None
 
-                posts = self._extract_posts_from_html(html, page_url)
-                logger.info(f"Found {len(posts)} posts/reels in payload for {page_url}")
+                for ep in endpoints:
+                    html, final_url = await asyncio.to_thread(self._fetch_page_html, ep)
+                    if final_url and not resolved_final_url:
+                        resolved_final_url = final_url
+                    if not html:
+                        continue
 
-                page_key = page_url.strip().lower()
-                final_key = (final_url or "").strip().lower()
+                    items = self._extract_posts_from_html(html, page_url)
+                    for it in items:
+                        if it["clean_url"].endswith("/photo.php") and not it.get("photo_url"):
+                            continue
+                        pid = it["id"]
+                        if pid not in discovered_for_page:
+                            discovered_for_page[pid] = it
+                        else:
+                            existing = discovered_for_page[pid]
+                            if not existing.get("title") and it.get("title"):
+                                existing["title"] = it["title"]
+                            if not existing.get("photo_url") and it.get("photo_url"):
+                                existing["photo_url"] = it["photo_url"]
+                            if not existing.get("creation_time") and it.get("creation_time"):
+                                existing["creation_time"] = it["creation_time"]
+
+                    await asyncio.sleep(random.uniform(2.0, 4.0))
+
+                posts = list(discovered_for_page.values())
+                posts.sort(key=lambda x: int(x.get("creation_time") or 0), reverse=True)
+                logger.info(f"Found {len(posts)} posts/reels across feed & reels tab for {page_url}")
+
+                page_key = normalize_page_url(page_url).lower()
+                final_key = normalize_page_url(resolved_final_url).lower() if resolved_final_url else None
                 is_uninitialized = (page_key not in self.initialized_pages and (not final_key or final_key not in self.initialized_pages))
 
                 if is_uninitialized:
-                    # Seed baseline for this newly added page without spamming historical posts
                     logger.info(f"Page {page_url} has not been initialized yet. Recording baseline of {len(posts)} existing posts.")
                     for post in posts:
                         self.mark_seen(post["id"], post)
@@ -754,7 +853,7 @@ class FacebookMonitor:
                     if final_key:
                         self.initialized_pages.add(final_key)
                     self._save_json(self.initialized_pages_file, list(self.initialized_pages))
-                    await asyncio.sleep(random.uniform(4, 8))
+                    await asyncio.sleep(random.uniform(3, 6))
                     continue
 
                 for post in posts:
@@ -765,7 +864,7 @@ class FacebookMonitor:
                         continue
 
                     # NEW POST DETECTED!
-                    logger.info(f"🔥 NEW UPLOAD DETECTED: {post['clean_url']} ({post['type']})")
+                    logger.info(f"🔥 NEW UPLOAD DETECTED: {post['clean_url']} ({post['type']}) on {post.get('page_name', page_url)}")
                     delivered = await self._download_and_broadcast(post)
                     if delivered:
                         self.mark_seen(post_key, post)
@@ -775,7 +874,7 @@ class FacebookMonitor:
                         logger.warning(f"Failed to deliver {clean_url}, will retry in next cycle.")
 
                 # Polite delay between consecutive pages
-                await asyncio.sleep(random.uniform(5.0, 10.0))
+                await asyncio.sleep(random.uniform(4.0, 8.0))
 
         except Exception as e:
             logger.error(f"Error during check cycle: {e}")

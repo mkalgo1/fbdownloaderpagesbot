@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 # Load local environment
 load_dotenv()
 
-from fb_monitor import FacebookMonitor, DEFAULT_PAGES, resolve_facebook_page
+from fb_monitor import FacebookMonitor, DEFAULT_PAGES, resolve_facebook_page, normalize_page_url
 
 # -------------------------------------------------------------------
 # LOGGING SETUP
@@ -175,20 +175,24 @@ async def self_ping_worker():
 # BASELINE SEEDING HELPER
 # -------------------------------------------------------------------
 async def seed_page_baseline(page_url: str):
-    """Fetches existing posts for a newly added page and seeds them so only new uploads trigger notifications."""
+    """Fetches existing posts for a newly added page across feed & reels tab and seeds them so only new uploads trigger notifications."""
     try:
-        html, final_url = await asyncio.to_thread(fb_monitor._fetch_page_html, page_url)
-        if html:
-            posts = fb_monitor._extract_posts_from_html(html, page_url)
-            for post in posts:
-                fb_monitor.mark_seen(post["id"], post)
-                fb_monitor.mark_seen(post["clean_url"], post)
-            logger.info(f"Baseline seeded for {page_url}: recorded {len(posts)} existing posts.")
-        p_key = page_url.strip().lower()
+        endpoints = fb_monitor.get_target_endpoints(page_url)
+        total_seeded = 0
+        for ep in endpoints:
+            html, _ = await asyncio.to_thread(fb_monitor._fetch_page_html, ep)
+            if html:
+                posts = fb_monitor._extract_posts_from_html(html, page_url)
+                for post in posts:
+                    if post["clean_url"].endswith("/photo.php") and not post.get("photo_url"):
+                        continue
+                    fb_monitor.mark_seen(post["id"], post)
+                    fb_monitor.mark_seen(post["clean_url"], post)
+                    total_seeded += 1
+        p_key = normalize_page_url(page_url).lower()
         fb_monitor.initialized_pages.add(p_key)
-        if final_url:
-            fb_monitor.initialized_pages.add(final_url.strip().lower())
         fb_monitor._save_json(fb_monitor.initialized_pages_file, list(fb_monitor.initialized_pages))
+        logger.info(f"Baseline seeded for {page_url}: recorded {total_seeded} existing posts across feed & reels.")
     except Exception as e:
         logger.warning(f"Error seeding baseline for {page_url}: {e}")
 
