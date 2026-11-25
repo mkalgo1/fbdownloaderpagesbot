@@ -283,14 +283,9 @@ class FacebookMonitor:
         headers = {
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9,fr;q=0.8",
-            "Cache-Control": "max-age=0",
-            "Sec-Ch-Ua": '"Not A(Brand";v="99", "Google Chrome";v="120", "Chromium";v="120"',
-            "Sec-Ch-Ua-Mobile": "?0",
-            "Sec-Ch-Ua-Platform": '"Windows"',
             "Sec-Fetch-Dest": "document",
             "Sec-Fetch-Mode": "navigate",
             "Sec-Fetch-Site": "none",
-            "Sec-Fetch-User": "?1",
             "Upgrade-Insecure-Requests": "1",
         }
 
@@ -319,6 +314,18 @@ class FacebookMonitor:
                 final_url = str(resp.url)
 
                 if any(x in final_url.lower() for x in ["/login", "/checkpoint", "/recover", "/help", "facebook.com/login"]):
+                    # Fallback to mobile Facebook endpoint if desktop was redirected to login
+                    if "m.facebook.com" not in url:
+                        m_url = url.replace("web.facebook.com", "m.facebook.com").replace("www.facebook.com", "m.facebook.com")
+                        logger.info(f"Retrying with mobile Facebook endpoint: {m_url}")
+                        try:
+                            m_resp = session.get(m_url, headers=headers, cookies=cookies, timeout=25, allow_redirects=True)
+                            m_final = str(m_resp.url)
+                            if m_resp.status_code == 200 and not any(x in m_final.lower() for x in ["/login", "/checkpoint", "/recover"]):
+                                return m_resp.text, m_final
+                        except Exception as me:
+                            logger.warning(f"Mobile fallback error for {m_url}: {me}")
+
                     logger.warning(f"Facebook HTTP redirect landed on auth/login page: {final_url}. Discarding.")
                     return None, None
 
