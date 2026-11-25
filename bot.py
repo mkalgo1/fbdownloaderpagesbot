@@ -46,7 +46,7 @@ TARGET_COMPRESSED_BYTES = 44 * 1024 * 1024  # 44 MB target for large video compr
 MAX_VIDEO_DURATION_SECONDS = 3600           # 60 minutes limit
 MAX_CONCURRENT_TASKS = 3                    # Concurrency semaphore
 PORT = int(os.getenv("PORT", "8080"))
-CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "360"))
+CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "180"))
 
 # Target chat ID from env if provided
 TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID")) if os.getenv("TARGET_CHAT_ID") else None
@@ -191,7 +191,9 @@ async def seed_page_baseline(page_url: str):
                     total_seeded += 1
         p_key = normalize_page_url(page_url).lower()
         fb_monitor.initialized_pages.add(p_key)
+        fb_monitor.page_last_checked[p_key] = time.time()
         fb_monitor._save_json(fb_monitor.initialized_pages_file, list(fb_monitor.initialized_pages))
+        fb_monitor._save_json(fb_monitor.last_checked_file, fb_monitor.page_last_checked)
         logger.info(f"Baseline seeded for {page_url}: recorded {total_seeded} existing posts across feed & reels.")
     except Exception as e:
         logger.warning(f"Error seeding baseline for {page_url}: {e}")

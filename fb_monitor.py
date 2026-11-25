@@ -1,4 +1,5 @@
 import asyncio
+import html as html_lib
 import json
 import logging
 import os
@@ -108,22 +109,25 @@ class FacebookMonitor:
         bot: Bot,
         data_dir: str = ".",
         target_chat_ids: Optional[List[int]] = None,
-        check_interval: int = 360,
+        check_interval: int = 180,
         pages: Optional[List[str]] = None,
     ):
         self.bot = bot
         self.data_dir = data_dir
         self.check_interval = max(60, check_interval)
         self.target_chat_ids = set(target_chat_ids or [])
+        self.start_time: float = time.time()
         
         self.seen_file = os.path.join(self.data_dir, "seen_posts.json")
         self.subscribers_file = os.path.join(self.data_dir, "subscribers.json")
         self.pages_file = os.path.join(self.data_dir, "monitored_pages.json")
         self.initialized_pages_file = os.path.join(self.data_dir, "initialized_pages.json")
+        self.last_checked_file = os.path.join(self.data_dir, "last_checked.json")
         
         self.seen_posts: Dict[str, dict] = self._load_json(self.seen_file, default={})
         self.subscribers: Set[int] = set(self._load_json(self.subscribers_file, default=[]))
         self.initialized_pages: Set[str] = set(self._load_json(self.initialized_pages_file, default=[]))
+        self.page_last_checked: Dict[str, float] = self._load_json(self.last_checked_file, default={})
 
         if self.target_chat_ids:
             self.subscribers.update(self.target_chat_ids)
@@ -306,6 +310,10 @@ class FacebookMonitor:
                 self.consecutive_errors = 0
                 final_url = str(resp.url)
 
+                if any(x in final_url.lower() for x in ["/login", "/checkpoint", "/recover", "/help", "facebook.com/login"]):
+                    logger.warning(f"Facebook HTTP redirect landed on auth/login page: {final_url}. Discarding.")
+                    return None, None
+
                 # Check if Facebook returned a client-side meta refresh or JS location replace
                 redirect_target = None
                 meta_match = re.search(r'<meta\s+http-equiv=["\']refresh["\']\s+content=["\'][0-9;\s]+url=([^"\'>]+)["\']', resp.text, re.IGNORECASE)
@@ -320,10 +328,10 @@ class FacebookMonitor:
                     if redirect_target.startswith("/"):
                         redirect_target = "https://web.facebook.com" + redirect_target
 
-                    # Reject auth/login redirects
+                    # Reject auth/login redirects - but keep the valid HTML payload returned by Facebook
                     if any(x in redirect_target.lower() for x in ["/login", "/checkpoint", "/recover", "/help", "facebook.com/login"]):
-                        logger.warning(f"Facebook returned auth/login redirect for {url}. Ignoring redirect.")
-                        return None, None
+                        logger.info(f"Ignoring client login redirect target for {url}. Using fetched page body ({len(resp.text)} bytes).")
+                        return resp.text, final_url
 
                     logger.info(f"Following Facebook client redirect: {url} -> {redirect_target}")
                     try:
@@ -658,13 +666,15 @@ class FacebookMonitor:
                     elif yt_title:
                         raw_caption = yt_title
 
+                safe_page = html_lib.escape(page_name)
+                safe_caption = html_lib.escape(raw_caption[:280]) if raw_caption else ""
                 caption_lines = [
-                    f"🔔 **New {post_type.capitalize()} Uploaded!**",
-                    f"📘 **Page:** {page_name}",
+                    f"🔔 <b>New {post_type.capitalize()} Uploaded!</b>",
+                    f"📘 <b>Page:</b> {safe_page}",
                 ]
-                if raw_caption:
-                    caption_lines.append(f"📌 {raw_caption[:280]}")
-                caption_lines.append(f"\n🔗 [Original Link]({post_url})")
+                if safe_caption:
+                    caption_lines.append(f"📌 {safe_caption}")
+                caption_lines.append(f'\n🔗 <a href="{post_url}">Original Link</a>')
                 caption_text = "\n".join(caption_lines)
 
                 size = os.path.getsize(video_path)
@@ -674,7 +684,8 @@ class FacebookMonitor:
                         try:
                             await self.bot.send_message(
                                 chat_id,
-                                f"⚠️ New video on **{page_name}** exceeds Telegram's 50 MB limit.\n\n🔗 Watch here: {post_url}"
+                                f"⚠️ New video on <b>{safe_page}</b> exceeds Telegram's 50 MB limit.\n\n🔗 Watch here: {post_url}",
+                                parse_mode="HTML"
                             )
                             delivered = True
                         except Exception as ce:
@@ -699,7 +710,7 @@ class FacebookMonitor:
                             chat_id=chat_id,
                             video=video_input,
                             caption=caption_text,
-                            parse_mode="Markdown",
+                            parse_mode="HTML",
                             thumbnail=thumb_input,
                             duration=duration,
                             width=width,
@@ -727,13 +738,15 @@ class FacebookMonitor:
                     except Exception as pe:
                         logger.warning(f"Error extracting photo og:image for {post_url}: {pe}")
 
+                safe_page = html_lib.escape(page_name)
+                safe_caption = html_lib.escape(raw_caption[:280]) if raw_caption else ""
                 caption_lines = [
-                    f"🔔 **New Photo Uploaded!**",
-                    f"📘 **Page:** {page_name}",
+                    f"🔔 <b>New Photo Uploaded!</b>",
+                    f"📘 <b>Page:</b> {safe_page}",
                 ]
-                if raw_caption:
-                    caption_lines.append(f"📌 {raw_caption[:280]}")
-                caption_lines.append(f"\n🔗 [Original Link]({post_url})")
+                if safe_caption:
+                    caption_lines.append(f"📌 {safe_caption}")
+                caption_lines.append(f'\n🔗 <a href="{post_url}">Original Link</a>')
                 caption_text = "\n".join(caption_lines)
 
                 img_path = os.path.join(temp_dir, f"photo_{uuid.uuid4().hex[:6]}.jpg")
@@ -775,7 +788,7 @@ class FacebookMonitor:
                                 chat_id=chat_id,
                                 photo=photo_input,
                                 caption=caption_text,
-                                parse_mode="Markdown"
+                                parse_mode="HTML"
                             )
                             logger.info(f"Delivered photo to chat {chat_id} from {page_name}")
                             delivered = True
@@ -849,6 +862,7 @@ class FacebookMonitor:
                 page_key = normalize_page_url(page_url).lower()
                 final_key = normalize_page_url(resolved_final_url).lower() if resolved_final_url else None
                 is_uninitialized = (page_key not in self.initialized_pages and (not final_key or final_key not in self.initialized_pages))
+                prev_check_time = self.page_last_checked.get(page_key, self.start_time)
 
                 if is_uninitialized:
                     logger.info(f"Page {page_url} has not been initialized yet. Recording baseline of {len(posts)} existing posts.")
@@ -858,7 +872,9 @@ class FacebookMonitor:
                     self.initialized_pages.add(page_key)
                     if final_key:
                         self.initialized_pages.add(final_key)
+                    self.page_last_checked[page_key] = time.time()
                     self._save_json(self.initialized_pages_file, list(self.initialized_pages))
+                    self._save_json(self.last_checked_file, self.page_last_checked)
                     await asyncio.sleep(random.uniform(3, 6))
                     continue
 
@@ -869,6 +885,41 @@ class FacebookMonitor:
                     if self.is_seen(post_key) or self.is_seen(clean_url):
                         continue
 
+                    # Strict timestamp filtering: only deliver posts/videos uploaded since last check to prevent old items from being sent
+                    creation_time = post.get("creation_time")
+                    if creation_time:
+                        try:
+                            c_time = int(creation_time)
+                            if c_time < (prev_check_time - 60):
+                                logger.info(f"Skipping old post {clean_url} from {page_url} (creation_time {c_time} < {int(prev_check_time - 60)})")
+                                self.mark_seen(post_key, post)
+                                self.mark_seen(clean_url, post)
+                                continue
+                        except Exception:
+                            pass
+
+                    # If video without GraphQL creation_time, verify upload timestamp via yt-dlp metadata
+                    if post.get("type") == "video":
+                        try:
+                            ydl_quick_opts = {
+                                "quiet": True,
+                                "no_warnings": True,
+                                "socket_timeout": 15,
+                                "http_headers": {
+                                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0",
+                                }
+                            }
+                            with yt_dlp.YoutubeDL(ydl_quick_opts) as ydl:
+                                q_info = await asyncio.to_thread(ydl.extract_info, clean_url, download=False)
+                                v_ts = q_info.get("timestamp")
+                                if v_ts and int(v_ts) < (prev_check_time - 60):
+                                    logger.info(f"Skipping old video {clean_url} (uploaded at {v_ts} < check baseline {int(prev_check_time - 60)})")
+                                    self.mark_seen(post_key, post)
+                                    self.mark_seen(clean_url, post)
+                                    continue
+                        except Exception as ve:
+                            logger.warning(f"Could not verify video upload timestamp for {clean_url}: {ve}")
+
                     # NEW POST DETECTED!
                     logger.info(f"🔥 NEW UPLOAD DETECTED: {post['clean_url']} ({post['type']}) on {post.get('page_name', page_url)}")
                     delivered = await self._download_and_broadcast(post)
@@ -878,6 +929,10 @@ class FacebookMonitor:
                         new_items_count += 1
                     else:
                         logger.warning(f"Failed to deliver {clean_url}, will retry in next cycle.")
+
+                # Record last check timestamp for this page
+                self.page_last_checked[page_key] = time.time()
+                self._save_json(self.last_checked_file, self.page_last_checked)
 
                 # Polite delay between consecutive pages
                 await asyncio.sleep(random.uniform(4.0, 8.0))
@@ -895,13 +950,10 @@ class FacebookMonitor:
     # -------------------------------------------------------------------
     async def start_loop(self):
         """
-        Continuous polite background loop.
-        Automatically avoids Facebook bot blocks by:
-        - Introducing ±45s random jitter between checks.
-        - Backing off exponentially if Facebook throttles (consecutive_errors).
+        Continuous background loop running every 3 minutes (180 seconds).
         """
         self.running = True
-        logger.info("Facebook auto-checker loop started.")
+        logger.info("Facebook auto-checker loop started (3-minute interval).")
         
         # Initial check after 8s warmup
         await asyncio.sleep(8)
@@ -909,18 +961,17 @@ class FacebookMonitor:
 
         while self.running:
             try:
-                jitter = random.uniform(-30.0, 60.0)
-                current_interval = self.check_interval + jitter
+                current_interval = max(60, self.check_interval)
 
                 if self.consecutive_errors > 0:
                     backoff_multiplier = min(self.consecutive_errors, 5)
-                    backoff_delay = backoff_multiplier * 300
+                    backoff_delay = backoff_multiplier * 180
                     logger.warning(
                         f"Backing off for {backoff_delay}s due to {self.consecutive_errors} consecutive errors."
                     )
                     await asyncio.sleep(backoff_delay)
                 else:
-                    logger.info(f"Sleeping for {int(current_interval)}s until next Facebook check...")
+                    logger.info(f"Sleeping for {int(current_interval)}s (3 minutes) until next Facebook check...")
                     await asyncio.sleep(current_interval)
 
                 await self.check_pages_once()
