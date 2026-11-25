@@ -523,11 +523,11 @@ class FacebookMonitor:
                                 return res
             return None
 
-        def parse_recursive(obj):
+        def parse_recursive(obj, current_creation_time=None):
             if isinstance(obj, dict):
                 permalink = obj.get("permalink_url") or obj.get("url")
                 post_id = obj.get("post_id") or obj.get("id")
-                creation_time = obj.get("creation_time")
+                creation_time = obj.get("creation_time") or current_creation_time
                 
                 # Check for message / caption across GraphQL fields
                 text = ""
@@ -601,10 +601,10 @@ class FacebookMonitor:
                                     existing["page_name"] = page_name
 
                 for v in obj.values():
-                    parse_recursive(v)
+                    parse_recursive(v, creation_time)
             elif isinstance(obj, list):
                 for item in obj:
-                    parse_recursive(item)
+                    parse_recursive(item, current_creation_time)
 
         scripts = re.findall(r'<script type="application/json"[^>]*>(.*?)</script>', html)
         for scr in scripts:
@@ -1043,6 +1043,32 @@ class FacebookMonitor:
                                     continue
                         except Exception as ve:
                             logger.warning(f"Could not verify video upload timestamp for {clean_url}: {ve}")
+
+                    # If photo without GraphQL creation_time, verify publication timestamp directly from photo page
+                    if post.get("type") == "photo" and not creation_time:
+                        try:
+                            p_html, _ = await asyncio.to_thread(self._fetch_page_html, clean_url)
+                            if p_html:
+                                ts_m = re.findall(r'"creation_time":\s*(\d+)', p_html)
+                                if ts_m:
+                                    c_time = int(ts_m[0])
+                                    post["creation_time"] = c_time
+                                    if c_time < (prev_check_time - 60):
+                                        logger.info(f"Skipping old photo {clean_url} (photo creation_time {c_time} < check baseline {int(prev_check_time - 60)})")
+                                        self.mark_seen(post_key, post)
+                                        self.mark_seen(clean_url, post)
+                                        continue
+                                else:
+                                    # If timestamp cannot be determined, mark seen & skip to prevent sending old media
+                                    logger.warning(f"Skipping unverified photo {clean_url}: creation_time absent")
+                                    self.mark_seen(post_key, post)
+                                    self.mark_seen(clean_url, post)
+                                    continue
+                        except Exception as pe:
+                            logger.warning(f"Could not verify photo timestamp for {clean_url}: {pe}")
+                            self.mark_seen(post_key, post)
+                            self.mark_seen(clean_url, post)
+                            continue
 
                     # NEW POST DETECTED!
                     logger.info(f"🔥 NEW UPLOAD DETECTED: {post['clean_url']} ({post['type']}) on {post.get('page_name', page_url)}")
