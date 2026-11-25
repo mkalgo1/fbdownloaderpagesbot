@@ -189,9 +189,19 @@ async def seed_page_baseline(page_url: str):
                     fb_monitor.mark_seen(post["id"], post)
                     fb_monitor.mark_seen(post["clean_url"], post)
                     total_seeded += 1
+            await asyncio.sleep(2.0)
+
         p_key = normalize_page_url(page_url).lower()
         fb_monitor.initialized_pages.add(p_key)
         fb_monitor.page_last_checked[p_key] = time.time()
+
+        # Also register numeric canonical URL in initialized set if present
+        id_m = re.search(r"id=(\d+)", page_url) or re.search(r"/people/[^/]+/(\d+)", page_url)
+        if id_m:
+            canon_key = f"https://web.facebook.com/profile.php?id={id_m.group(1)}".lower()
+            fb_monitor.initialized_pages.add(canon_key)
+            fb_monitor.page_last_checked[canon_key] = time.time()
+
         fb_monitor._save_json(fb_monitor.initialized_pages_file, list(fb_monitor.initialized_pages))
         fb_monitor._save_json(fb_monitor.last_checked_file, fb_monitor.page_last_checked)
         logger.info(f"Baseline seeded for {page_url}: recorded {total_seeded} existing posts across feed & reels.")
@@ -407,17 +417,19 @@ async def cmd_addpage(msg: Message):
     parts = msg.text.split(maxsplit=1)
     if len(parts) > 1:
         raw_input = parts[1].strip()
-        status_msg = await msg.reply("🔍 **Detecting Facebook page credentials...**")
+        status_msg = await msg.reply("🔍 **Detecting & verifying Facebook page credentials...**")
         p_url, p_name, err = await asyncio.to_thread(resolve_facebook_page, raw_input)
         if p_url:
             fb_monitor.add_page(p_url)
+            fb_monitor.add_subscriber(msg.chat.id)
             asyncio.create_task(seed_page_baseline(p_url))
             pages_list = "\n".join([f"{idx+1}. `{p}`" for idx, p in enumerate(fb_monitor.pages)])
             await status_msg.edit_text(
-                f"✅ **Successfully Added to Auto-Grab Monitor!**\n\n"
+                f"✅ **Successfully Added to Auto-Tracker!**\n\n"
                 f"📘 **Page Name:** *{p_name}*\n"
-                f"🔗 **Page URL:** `{p_url}`\n\n"
-                f"Whenever a new video, reel, or photo is uploaded, it will be automatically delivered here in HD!\n\n"
+                f"🔗 **Canonical URL:** `{p_url}`\n\n"
+                f"⏱ **Checking Frequency:** Every 3 minutes\n"
+                f"🔔 All current posts are being indexed into the baseline. Any new videos, reels, and photos uploaded from now on will be automatically delivered here in HD!\n\n"
                 f"📋 **Monitored Pages ({len(fb_monitor.pages)}):**\n{pages_list}"
             )
         else:
@@ -425,12 +437,12 @@ async def cmd_addpage(msg: Message):
     else:
         LOCAL_USER_STATES[msg.chat.id] = "awaiting_add_page"
         await msg.reply(
-            "➕ **Add Facebook Page to Auto-Grab Monitor**\n\n"
-            "What page would you like to add to the auto-grab list? You can reply with:\n\n"
-            "1️⃣ **Page Link:** e.g. `https://facebook.com/pagename`\n"
-            "2️⃣ **Page Username / Slug:** e.g. `lavialyon` or `@lavialyon`\n"
+            "➕ **Add Facebook Page to Auto-Tracker**\n\n"
+            "What page would you like to add? You can reply with:\n\n"
+            "1️⃣ **Page Link:** e.g. `https://facebook.com/pagename` or `https://facebook.com/profile.php?id=...`\n"
+            "2️⃣ **Page Username / Slug:** e.g. `lefigaro` or `@lavialyon`\n"
             "3️⃣ **Any Video / Reel Link from that page:** e.g. `https://facebook.com/reel/123456...`\n"
-            "    *(The bot will automatically detect the creator page credentials!)*\n\n"
+            "    *(The bot will automatically detect the creator page and its ID!)*\n\n"
             "👉 *Send your page or video link now, or send `/cancel` to abort.*"
         )
 
@@ -448,7 +460,7 @@ async def cmd_delpage(msg: Message):
             await msg.reply(f"❌ Could not find a matching page to remove.")
     else:
         pages_list = "\n".join([f"{idx+1}. `{p}`" for idx, p in enumerate(fb_monitor.pages)])
-        await msg.reply(f"🗑 **Remove a Monitored Page**\n\nSend `/del <number>` to remove a page:\n\n{pages_list}")
+        await msg.reply(f"🗑 **Remove a Monitored Page**\n\nSend `/del <number or url>` to remove a page:\n\n{pages_list}")
 
 
 # -------------------------------------------------------------------
@@ -462,13 +474,15 @@ async def process_link(msg: Message):
         p_url, p_name, err = await asyncio.to_thread(resolve_facebook_page, msg.text)
         if p_url:
             fb_monitor.add_page(p_url)
+            fb_monitor.add_subscriber(msg.chat.id)
             asyncio.create_task(seed_page_baseline(p_url))
             pages_list = "\n".join([f"{idx+1}. `{p}`" for idx, p in enumerate(fb_monitor.pages)])
             await status_msg.edit_text(
-                f"✅ **Successfully Added to Auto-Grab Monitor!**\n\n"
+                f"✅ **Successfully Added to Auto-Tracker!**\n\n"
                 f"📘 **Page Name:** *{p_name}*\n"
-                f"🔗 **Page URL:** `{p_url}`\n\n"
-                f"Whenever a new video, reel, or photo is uploaded, it will be automatically delivered here in HD!\n\n"
+                f"🔗 **Canonical URL:** `{p_url}`\n\n"
+                f"⏱ **Checking Frequency:** Every 3 minutes\n"
+                f"🔔 Existing posts are now recorded in the baseline. Any new videos, reels, and photos uploaded from now on will be automatically delivered here in HD!\n\n"
                 f"📋 **Monitored Pages ({len(fb_monitor.pages)}):**\n{pages_list}"
             )
         else:
@@ -483,6 +497,35 @@ async def process_link(msg: Message):
     platform = detect_platform(url)
 
     if platform.get("name") != "Facebook":
+        await msg.reply(
+            "ℹ️ **Dedicated Facebook Auto-Tracker Bot**\n\n"
+            "This bot (@fbdownloaderpagesvidsbot) is dedicated exclusively to auto-tracking Facebook pages.\n\n"
+            "💡 For on-demand downloads from **TikTok, Instagram, Pinterest, YouTube, X, Reddit**, please use your main downloader bot: **@vidsmkdownloaderbot**!"
+        )
+        return
+
+    # Intelligent detection: If user simply pastes a Facebook Page or Profile link directly
+    is_media_link = any(x in url.lower() for x in ["/reel/", "/videos/", "watch", "fb.watch", "/video.php", "/photo", "fbid="])
+    if not is_media_link:
+        status_msg = await msg.reply("🔍 **Detected Facebook Page link! Resolving credentials & setting up auto-tracker...**")
+        p_url, p_name, err = await asyncio.to_thread(resolve_facebook_page, url)
+        if p_url:
+            fb_monitor.add_page(p_url)
+            fb_monitor.add_subscriber(msg.chat.id)
+            asyncio.create_task(seed_page_baseline(p_url))
+            pages_list = "\n".join([f"{idx+1}. `{p}`" for idx, p in enumerate(fb_monitor.pages)])
+            await status_msg.edit_text(
+                f"✅ **Facebook Page Detected & Added to Auto-Tracker!**\n\n"
+                f"📘 **Page Name:** *{p_name}*\n"
+                f"🔗 **Canonical Page URL:** `{p_url}`\n\n"
+                f"⏱ **Monitoring Active:** The bot automatically checks this page every 3 minutes.\n"
+                f"🔔 Any new videos, reels, or photos uploaded from this moment forward will be automatically delivered to you here in HD!\n\n"
+                f"📋 **All Monitored Pages ({len(fb_monitor.pages)}):**\n{pages_list}"
+            )
+            return
+        else:
+            await status_msg.edit_text(f"❌ Could not resolve Facebook page credentials: {err or 'Invalid page link'}")
+            return
         await msg.reply(
             "ℹ️ **Dedicated Facebook Auto-Tracker Bot**\n\n"
             "This bot (@fbdownloaderpagesvidsbot) is dedicated exclusively to auto-tracking Facebook pages.\n\n"

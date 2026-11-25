@@ -43,13 +43,89 @@ def normalize_page_url(u: str) -> str:
     return clean
 
 
+def resolve_facebook_slug_to_id(slug_or_url: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    Given any Facebook page slug, username, handle, or URL:
+    Resolves the canonical numeric page ID and clean page title.
+    Returns (numeric_id, canonical_url, page_title)
+    """
+    text = slug_or_url.strip()
+    if not text:
+        return None, None, None
+
+    # 1. Direct match for profile.php?id=\d+
+    id_m = re.search(r"id=(\d+)", text)
+    if id_m:
+        uid = id_m.group(1)
+        return uid, f"https://web.facebook.com/profile.php?id={uid}", "Facebook Page"
+
+    # 2. Match /people/.../(\d+)
+    people_m = re.search(r"/people/([^/]+)/(\d+)", text)
+    if people_m:
+        name = people_m.group(1).replace("-", " ")
+        uid = people_m.group(2)
+        return uid, f"https://web.facebook.com/profile.php?id={uid}", name
+
+    # 3. Extract slug from URL or username
+    clean = text.split("?")[0].rstrip("/")
+    if "facebook.com" in clean.lower():
+        parts = [p for p in clean.split("/") if p and "facebook.com" not in p and p not in ["pages", "p", "pg", "people"]]
+        slug = parts[-1] if parts else clean
+    else:
+        slug = clean.lstrip("@").strip()
+
+    if not slug or any(x in slug.lower() for x in ["login", "recover", "help", "checkpoint", "settings"]):
+        return None, None, None
+
+    # Known vanity slug overrides
+    if slug.lower() == "lavialyon":
+        return "1269304149599939", "https://web.facebook.com/profile.php?id=1269304149599939", "La vie à Lyon France"
+
+    # Dynamic fetch from mobile Facebook to extract numeric ID and title
+    m_url = f"https://m.facebook.com/{slug}"
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9,fr;q=0.8",
+        }
+        if HAS_CURL_CFFI:
+            r = cffi_requests.get(m_url, headers=headers, impersonate="chrome120", allow_redirects=True, timeout=12)
+        else:
+            r = requests.get(m_url, headers=headers, allow_redirects=True, timeout=12)
+
+        resp_text = r.text
+        uid_match = (
+            re.search(r'"delegate_page":\{"id":"(\d+)"\}', resp_text) or
+            re.search(r'al:android:url[^>]*content="fb://profile/(\d+)"', resp_text) or
+            re.search(r'fb://profile/(\d+)', resp_text) or
+            re.search(r'fb://page/(?:id=|\?id=)?(\d+)', resp_text) or
+            re.search(r'entity_id=(\d+)', resp_text) or
+            re.search(r'"userID":"(\d+)"', resp_text) or
+            re.search(r'"pageID":"(\d+)"', resp_text) or
+            re.search(r'/profile\.php\?id=(\d+)', resp_text)
+        )
+
+        title_m = re.search(r'<meta\s+property=["\']og:title["\']\s+content=["\']([^"\']+)["\']', resp_text) or re.search(r'<title>(.*?)</title>', resp_text)
+        raw_title = title_m.group(1).replace(" | Facebook", "").strip() if title_m else slug
+        import html as html_lib_local
+        clean_title = html_lib_local.unescape(raw_title)
+
+        if uid_match:
+            uid = uid_match.group(1)
+            return uid, f"https://web.facebook.com/profile.php?id={uid}", clean_title
+    except Exception as e:
+        logger.warning(f"Error dynamically resolving slug '{slug}': {e}")
+
+    return None, None, None
+
+
 def resolve_facebook_page(input_str: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """
     Intelligently extracts Facebook page credentials from:
     1. A video or reel link (detects creator page uploader_id and resolves canonical page URL)
-    2. A full Facebook Page URL (e.g. facebook.com/lavialyon or profile.php?id=...)
+    2. A full Facebook Page URL (e.g. facebook.com/lefigaro or profile.php?id=...)
     3. A Facebook username or handle (e.g. lavialyon or @lavialyon)
-    Returns (page_url, page_name, error_message)
+    Returns (canonical_page_url, page_name, error_message)
     """
     text = input_str.strip()
     if not text:
@@ -67,41 +143,27 @@ def resolve_facebook_page(input_str: str) -> Tuple[Optional[str], Optional[str],
                 uid = info.get("uploader_id")
                 uploader_name = info.get("uploader")
                 if uid:
-                    page_url = f"https://web.facebook.com/profile.php?id={uid}"
-                    try:
-                        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0"}
-                        if HAS_CURL_CFFI:
-                            r = cffi_requests.get(page_url, impersonate="chrome120", allow_redirects=True, timeout=10)
-                        else:
-                            r = cffi_requests.get(page_url, headers=headers, allow_redirects=True, timeout=10)
-                        if r.status_code == 200 and "facebook.com" in r.url:
-                            clean_r_url = r.url.split("?")[0].rstrip("/")
-                            if not any(x in clean_r_url for x in ["/login", "/recover", "/help", "checkpoint"]):
-                                page_url = clean_r_url
-                    except Exception:
-                        pass
-                    return page_url, uploader_name or "Facebook Creator", None
+                    canonical_url = f"https://web.facebook.com/profile.php?id={uid}"
+                    return canonical_url, uploader_name or "Facebook Creator", None
         except Exception as e:
             logger.warning(f"Could not extract uploader from video link: {e}")
 
-    # 2. Check if it's already a full Facebook URL
+    # 2. Universal dynamic numeric resolution for ANY page URL, handle, or slug
+    uid, canonical_url, page_title = resolve_facebook_slug_to_id(text)
+    if canonical_url and uid:
+        return canonical_url, page_title or "Facebook Page", None
+
+    # 3. Fallback for vanity URLs if network resolution failed
     if "facebook.com" in text.lower():
         clean_url = text.split("?")[0].rstrip("/")
         if not clean_url.startswith("http"):
             clean_url = "https://" + clean_url
         name_guess = clean_url.rstrip("/").split("/")[-1]
-        if "profile.php" in clean_url:
-            name_guess = text.split("id=")[-1].split("&")[0] if "id=" in text else "Facebook Page"
         return clean_url, name_guess, None
 
-    # 3. Check if it's a handle or username (e.g. @lavialyon or lavialyon)
     clean_handle = text.lstrip("@").strip()
-    if clean_handle.lower() == "lavialyon":
-        return "https://web.facebook.com/profile.php?id=1269304149599939", "La vie à Lyon France", None
-
     if re.match(r"^[a-zA-Z0-9._-]+$", clean_handle):
-        page_url = f"https://web.facebook.com/{clean_handle}"
-        return page_url, clean_handle, None
+        return f"https://web.facebook.com/{clean_handle}", clean_handle, None
 
     return None, None, f"Unrecognized Facebook page format: '{text}'"
 
@@ -126,11 +188,18 @@ class FacebookMonitor:
         self.pages_file = os.path.join(self.data_dir, "monitored_pages.json")
         self.initialized_pages_file = os.path.join(self.data_dir, "initialized_pages.json")
         self.last_checked_file = os.path.join(self.data_dir, "last_checked.json")
+        self.page_id_map_file = os.path.join(self.data_dir, "page_id_map.json")
         
         self.seen_posts: Dict[str, dict] = self._load_json(self.seen_file, default={})
         self.subscribers: Set[int] = set(self._load_json(self.subscribers_file, default=[]))
         self.initialized_pages: Set[str] = set(self._load_json(self.initialized_pages_file, default=[]))
         self.page_last_checked: Dict[str, float] = self._load_json(self.last_checked_file, default={})
+        self.page_id_map: Dict[str, str] = self._load_json(self.page_id_map_file, default={
+            "lavialyon": "1269304149599939",
+            "61556328743295": "61556328743295",
+            "100083193627339": "100083193627339",
+            "1269304149599939": "1269304149599939",
+        })
 
         if self.target_chat_ids:
             self.subscribers.update(self.target_chat_ids)
@@ -207,6 +276,23 @@ class FacebookMonitor:
 
     def add_page(self, page_url: str) -> bool:
         clean_url = page_url.strip()
+        
+        # Check if numeric ID is present or dynamically resolve it
+        id_m = re.search(r"id=(\d+)", clean_url) or re.search(r"/people/[^/]+/(\d+)", clean_url)
+        if id_m:
+            uid = id_m.group(1)
+            clean_url = f"https://web.facebook.com/profile.php?id={uid}"
+            self.page_id_map[uid] = uid
+            self._save_json(self.page_id_map_file, self.page_id_map)
+        else:
+            uid, canonical_url, _ = resolve_facebook_slug_to_id(clean_url)
+            if uid and canonical_url:
+                slug = clean_url.split("?")[0].rstrip("/").split("/")[-1].lstrip("@").lower()
+                clean_url = canonical_url
+                self.page_id_map[slug] = uid
+                self.page_id_map[uid] = uid
+                self._save_json(self.page_id_map_file, self.page_id_map)
+
         norm_new = normalize_page_url(clean_url)
         for p in self.pages:
             if normalize_page_url(p) == norm_new:
@@ -245,15 +331,12 @@ class FacebookMonitor:
 
     def get_target_endpoints(self, page_url: str) -> List[str]:
         """
-        Returns both the main page feed and the reels tab for any page URL
-        so both standard video/photo posts and creator reels are monitored.
+        Returns both the main page feed and the reels tab for any page URL.
+        Always resolves to canonical profile.php?id={uid} to bypass datacenter login barriers.
         """
         clean = page_url.strip().rstrip("/")
-        if "lavialyon" in clean.lower():
-            return [
-                "https://web.facebook.com/profile.php?id=1269304149599939",
-                "https://web.facebook.com/profile.php?id=1269304149599939&sk=reels_tab",
-            ]
+        
+        # 1. Direct regex for numeric ID in URL
         id_m = re.search(r"id=(\d+)", clean) or re.search(r"/people/[^/]+/(\d+)", clean)
         if id_m:
             uid = id_m.group(1)
@@ -261,11 +344,31 @@ class FacebookMonitor:
                 f"https://web.facebook.com/profile.php?id={uid}",
                 f"https://web.facebook.com/profile.php?id={uid}&sk=reels_tab",
             ]
-        else:
+            
+        # 2. Check cached page_id_map
+        slug = clean.split("?")[0].rstrip("/").split("/")[-1].lstrip("@").lower()
+        if slug in self.page_id_map:
+            uid = self.page_id_map[slug]
             return [
-                f"{clean}/",
-                f"{clean}/reels_tab/",
+                f"https://web.facebook.com/profile.php?id={uid}",
+                f"https://web.facebook.com/profile.php?id={uid}&sk=reels_tab",
             ]
+            
+        # 3. Dynamic resolution on the fly if not yet mapped
+        uid, _, _ = resolve_facebook_slug_to_id(slug)
+        if uid:
+            self.page_id_map[slug] = uid
+            self._save_json(self.page_id_map_file, self.page_id_map)
+            return [
+                f"https://web.facebook.com/profile.php?id={uid}",
+                f"https://web.facebook.com/profile.php?id={uid}&sk=reels_tab",
+            ]
+
+        # 4. Fallback if resolution failed
+        return [
+            f"{clean}/",
+            f"{clean}/reels_tab/",
+        ]
 
     # -------------------------------------------------------------------
     # ANTI-BLOCK REQUEST DISPATCHER (TLS Impersonation + Safe Redirects)
