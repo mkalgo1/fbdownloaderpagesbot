@@ -28,7 +28,7 @@ logger = logging.getLogger("FacebookMonitor")
 DEFAULT_PAGES = [
     "https://web.facebook.com/people/Paris-France-Tour/61556328743295/",
     "https://web.facebook.com/people/FX-France-Express/100083193627339/",
-    "https://web.facebook.com/lavialyon",
+    "https://web.facebook.com/profile.php?id=1269304149599939",
 ]
 
 MAX_TELEGRAM_BYTES = 48 * 1024 * 1024       # 48 MB safe cap
@@ -96,6 +96,9 @@ def resolve_facebook_page(input_str: str) -> Tuple[Optional[str], Optional[str],
 
     # 3. Check if it's a handle or username (e.g. @lavialyon or lavialyon)
     clean_handle = text.lstrip("@").strip()
+    if clean_handle.lower() == "lavialyon":
+        return "https://web.facebook.com/profile.php?id=1269304149599939", "La vie à Lyon France", None
+
     if re.match(r"^[a-zA-Z0-9._-]+$", clean_handle):
         page_url = f"https://web.facebook.com/{clean_handle}"
         return page_url, clean_handle, None
@@ -246,6 +249,11 @@ class FacebookMonitor:
         so both standard video/photo posts and creator reels are monitored.
         """
         clean = page_url.strip().rstrip("/")
+        if "lavialyon" in clean.lower():
+            return [
+                "https://web.facebook.com/profile.php?id=1269304149599939",
+                "https://web.facebook.com/profile.php?id=1269304149599939&sk=reels_tab",
+            ]
         id_m = re.search(r"id=(\d+)", clean) or re.search(r"/people/[^/]+/(\d+)", clean)
         if id_m:
             uid = id_m.group(1)
