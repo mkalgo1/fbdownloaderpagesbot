@@ -322,6 +322,10 @@ class FacebookMonitor:
                     logger.warning(f"Facebook HTTP redirect landed on auth/login page: {final_url}. Discarding.")
                     return None, None
 
+                # If the fetched body already contains rich page data (Relay/GraphQL scripts or reels), use it directly
+                if len(resp.text) > 200000 and ("application/json" in resp.text or "/reel/" in resp.text or "creation_time" in resp.text):
+                    return resp.text, final_url
+
                 # Check if Facebook returned a client-side meta refresh or JS location replace
                 redirect_target = None
                 meta_match = re.search(r'<meta\s+http-equiv=["\']refresh["\']\s+content=["\'][0-9;\s]+url=([^"\'>]+)["\']', resp.text, re.IGNORECASE)
@@ -335,6 +339,8 @@ class FacebookMonitor:
                 if redirect_target and redirect_target != url:
                     if redirect_target.startswith("/"):
                         redirect_target = "https://web.facebook.com" + redirect_target
+                    elif redirect_target.startswith("https://www.facebook.com"):
+                        redirect_target = redirect_target.replace("https://www.facebook.com", "https://web.facebook.com")
 
                     # Reject auth/login redirects - but keep the valid HTML payload returned by Facebook
                     if any(x in redirect_target.lower() for x in ["/login", "/checkpoint", "/recover", "/help", "facebook.com/login"]):
